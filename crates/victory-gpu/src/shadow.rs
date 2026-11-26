@@ -712,6 +712,10 @@ impl Shadow {
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
                     }
+                    // The copy took the title's other bytes too, even when no
+                    // write was needed. A later partial overlap must not take
+                    // those merged bytes for new GPU writes.
+                    snapshot.refresh(at, host);
                     synced.push((start + at) / PAGE);
                 }
                 if self.has_widened.load(Ordering::Acquire) {
@@ -3092,6 +3096,81 @@ pub(crate) mod tests {
         assert_eq!(actual, [0x33, 0x44, 0xb2, 0x55]);
         assert_eq!(marked, PAGE - 16, "only the first marked page wrote back");
         assert_eq!(declared, PAGE, "only the unmarked middle page wrote back");
+    }
+
+    /// A partial overlap is not covered by the whole-page comparison set.
+    /// Its second copy-back must leave bytes the title wrote after the first.
+    #[test]
+    fn overlapping_copy_backs_do_not_clobber_newer_cpu_writes() {
+        let cases = [
+            ("partial_then_wider", (0, 0x1000), (0, 0x2000), 0),
+            ("partial_then_whole", (0x1000, 0x1000), (0, PAGE), 0x1000),
+            ("whole_then_partial", (0, PAGE), (0x1000, 0x1000), 0x1000),
+            (
+                "across_page_boundary",
+                (PAGE - 16, 32),
+                (PAGE - 32, 64),
+                PAGE - 8,
+            ),
+        ];
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for (label, (off1, len1), (off2, len2), probe) in cases {
+            for already_published in [false, true] {
+                let p = crate::watch::tests::pool(2);
+                let len = 2 * PAGE;
+                let write_title = |at: usize, v: u8| {
+                    // SAFETY: bytes inside this test's live allocation.
+                    unsafe { ((p + at) as *mut u8).write_volatile(v) };
+                };
+                let read_title = |at: usize| {
+                    // SAFETY: the allocation stays live until after these reads.
+                    unsafe { ((p + at) as *const u8).read_volatile() }
+                };
+                write_title(probe, 0x11);
+                write_title(probe + 1, 0x11);
+                register(p, p as u64, len as u64);
+                let Some(copy) = find(p as u64, len as u64) else {
+                    unregister(p, p as u64);
+                    crate::watch::tests::free(p);
+                    return; // no host GPU here
+                };
+                copy.update(p, len);
+                copy.writing(p + off1, len1, false);
+                copy.writing(p + off2, len2, false);
+                copy.write_host((p + probe) as u64, &[0xaa]);
+                // A GPU write outside the first range must still go back later.
+                // In the whole-then-partial case it already goes back with the first.
+                let tail = off2 + len2 - 1;
+                copy.write_host((p + tail) as u64, &[0xbb]);
+                write_title(probe + 1, 0x22);
+                if already_published {
+                    write_title(probe, 0xaa);
+                    if (off1..off1 + len1).contains(&tail) {
+                        write_title(tail, 0xbb);
+                    }
+                }
+                let first = copy.copy_back(p + off1, len1);
+                assert_eq!([read_title(probe), read_title(probe + 1)], [0xaa, 0x22]);
+                if already_published {
+                    assert_eq!(first, 0, "{label}: merge without a title write");
+                }
+                write_title(probe, 0x66);
+                write_title(probe + 1, 0x33);
+                copy.copy_back(p + off2, len2);
+                actual.push((
+                    label,
+                    already_published,
+                    [read_title(probe), read_title(probe + 1), read_title(tail)],
+                ));
+                expected.push((label, already_published, [0x66, 0x33, 0xbb]));
+                unregister(p, p as u64);
+                drop(copy);
+                crate::watch::tests::free(p);
+            }
+        }
+        assert_eq!(actual, expected);
+        eprintln!("checked {} overlapping copy-back cases", actual.len());
     }
 
     /// Mark bits are handed out in runs and come back joined.

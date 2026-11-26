@@ -155,7 +155,7 @@ impl Snapshot {
         Some(scratch)
     }
 
-    /// A refresh before the GPU runs changes the baseline for the captured bytes.
+    /// Advance captured bytes after a CPU refresh or a completed copy-back merge.
     pub(super) fn refresh(&mut self, start: usize, host: &[u8]) {
         let end = start + host.len();
         let first = self.spans.partition_point(|span| span.end <= start);
