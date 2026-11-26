@@ -866,8 +866,11 @@ fn lane_reads_pass_between_halves() {
     ]
     .concat();
     assert_eq!(refusal(&first_alone, 64, 0), "translated");
-    // Nor does a value the same in every lane: a buffer dword loaded at an
-    // offset the same in every lane, through a scalar descriptor.
+    // A buffer dword loaded at an offset the same in every lane, through a
+    // scalar descriptor, with a store present (`store(5, 0)` below): not
+    // proven the same in every lane, so the first-lane read passes the
+    // value between the halves in the entry block, where every lane of the
+    // group runs it together.
     assert_eq!(
         refusal(&first_lane_of_a_buffer_load(3), 64, 0),
         "translated"

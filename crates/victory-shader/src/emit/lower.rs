@@ -57,6 +57,8 @@ pub(crate) struct Shape {
     pub atomics: Vec<usize>,
     /// `rawBufferLoad` calls.
     pub loads: usize,
+    /// `dx.op.barrier` calls (a cross-half exchange has two).
+    pub barriers: usize,
 }
 
 pub(crate) struct Lowered {
@@ -1790,6 +1792,7 @@ impl<'a> Lower<'a> {
                     branches,
                     atomics: self.s.m.written_call_blocks("dx.op.atomicBinOp.i32"),
                     loads: self.s.m.written_calls("dx.op.rawBufferLoad.f32"),
+                    barriers: self.s.m.written_calls("dx.op.barrier"),
                 }
             },
             #[cfg(test)]

@@ -1911,3 +1911,1165 @@ fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
     assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
 }
+
+/// Lowers a wave64 compute program of 64 threads as a host of 32-lane waves
+/// runs it (`host_wave32`: the console wave is two halves), with root
+/// constants in s[0:3] and no LDS (halves refuse one console wave's LDS).
+fn lower_halves(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
+    lower_halves_with(
+        words,
+        vec![RootParam {
+            sgprs: 4,
+            ..root(RootType::Constants, 0, 0)
+        }],
+        vec![],
+    )
+}
+
+/// [`lower_halves`] with the root parameters `layout` (in user SGPRs from s0
+/// on) and the used resources `used`.
+fn lower_halves_with(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+) -> Result<Lowered, crate::ShaderError> {
+    let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+    lower_halves_io(words, layout, used, sgprs.max(2) << 1, [64, 1, 1])
+}
+
+/// [`lower_halves_with`] with a custom `rsrc2` and thread count — a program
+/// that allocates LDS in a group of two console waves, say, where LDS keeps
+/// its barriers in halves and only the value analysis can refuse.
+fn lower_halves_io(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    rsrc2: u32,
+    threads: [u32; 3],
+) -> Result<Lowered, crate::ShaderError> {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 256,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+        code,
+    };
+    let p = ir::build(&native.code, true, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        host_wave32: true,
+        narrow_waves: false,
+        view_marks: false,
+    })
+}
+
+/// A `v_writelane_b32` asks for the console's lane layout (so the program
+/// runs in halves), and a branch on a compare of the thread id makes the
+/// block after it divergent. `read` (a first-lane read) goes there, and its
+/// SGPR result is branched on, so a refusal in it surfaces.
+const WRITELANE_V4_V1_5: [u32; 2] = [0xD761_0004, 0x0001_0B01]; // v_writelane_b32 v4, v1, 5
+
+fn divergent_read(w: &mut Vec<u32>, read: u32, cmp: u32) {
+    w.extend(WRITELANE_V4_V1_5);
+    w.extend([CMPX_V0_EQ_0, skip(3)]);
+    w.extend([read, cmp, 0xBF85_0001]); // s_cbranch_scc1 over the s_mov
+    w.extend([0xBE87_0380, S_ENDPGM]); // s_mov_b32 s7, 0; s_endpgm
+}
+
+/// A `global_load_dword` at an address the whole console wave holds alike
+/// loads one value, so a `v_readfirstlane_b32` of it inside a divergent
+/// block — where a cross-half exchange would be refused — lowers without
+/// one.
+#[test]
+fn a_uniform_global_loads_first_lane_read_needs_no_exchange() {
+    // v_mov_b32 v1, 0x1000; global_load_dword v2, v1, s[0:1], 0
+    let mut w = vec![0x7E02_02FF, 0x0000_1000];
+    w.extend(global(0x0C, 2, 1, 0, 0));
+    divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
+    let l = lower_halves(&w).expect("a uniform global load lowers in halves");
+    assert_eq!(l.wave_size, Some(32), "the console wave ran as two halves");
+    assert_eq!(
+        l.shape.barriers, 0,
+        "no cross-half exchange was emitted (where one would be refused)"
+    );
+    // The VGPR-pair address form (saddr = null): both words alike.
+    let mut w = vec![0x7E02_02FF, 0x0000_1000]; // v_mov_b32 v1, 0x1000
+    w.push(0x7E04_0280); // v_mov_b32 v2, 0
+    w.extend(global(0x0C, 3, 1, 0x7D, 0)); // global_load_dword v3, v[1:2], 0
+    divergent_read(&mut w, 0x7E0E_0503, 0xBF07_8007); // v_readfirstlane_b32 s7, v3; s_cmp_lg_u32 s7, 0
+    let l = lower_halves(&w).expect("a uniform VGPR-pair global load lowers in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(l.shape.barriers, 0, "no cross-half exchange was emitted");
+}
+
+/// A `global_load_dword` at a lane-varying address does not give a value the
+/// same in every lane: the first-lane read of it in a divergent block keeps
+/// its cross-half refusal, and in a block every lane runs together keeps
+/// its cross-half exchange.
+#[test]
+fn a_lane_varying_global_load_keeps_the_first_lane_refusal() {
+    let first_across = super::halves::FIRST_ACROSS;
+    let refused = |w: &[u32]| matches!(lower_halves(w), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across);
+    // The VGPR offset is the thread id.
+    let mut w = vec![0x7E02_0300]; // v_mov_b32 v1, v0
+    w.extend(global(0x0C, 2, 1, 0, 0)); // global_load_dword v2, v1, s[0:1], 0
+    divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
+    assert!(refused(&w), "a lane-varying VGPR offset keeps the refusal");
+    // The high dword of a VGPR-pair address is the thread id.
+    let mut w = vec![0x7E02_02FF, 0x0000_1000]; // v_mov_b32 v1, 0x1000
+    w.push(0x7E04_0300); // v_mov_b32 v2, v0
+    w.extend(global(0x0C, 3, 1, 0x7D, 0)); // global_load_dword v3, v[1:2], 0
+    divergent_read(&mut w, 0x7E0E_0503, 0xBF07_8007); // v_readfirstlane_b32 s7, v3; s_cmp_lg_u32 s7, 0
+    assert!(
+        refused(&w),
+        "a lane-varying second VGPR word keeps the refusal"
+    );
+    // The same lane-varying load, read first in the entry block every lane
+    // runs together: the cross-half exchange is kept.
+    let mut w = vec![0x7E02_0300]; // v_mov_b32 v1, v0
+    w.extend(global(0x0C, 2, 1, 0, 0)); // global_load_dword v2, v1, s[0:1], 0
+    w.extend(WRITELANE_V4_V1_5);
+    w.extend([0x7E0C_0502, 0xBF07_8006, 0xBF85_0001, 0xBE87_0380, S_ENDPGM]);
+    let l = lower_halves(&w).expect("an exchange can go in the entry block");
+    assert!(l.shape.barriers > 0, "the cross-half exchange was emitted");
+}
+
+/// GLOBAL `global_store_dword` of `vdata` at `s[saddr:saddr+1] + vaddr +
+/// offset`.
+const fn global_store(vdata: u8, vaddr: u8, saddr: u8, offset: u32) -> [u32; 2] {
+    [
+        0x37 << 26 | 0x1C << 18 | 2 << 14 | (offset & 0xFFF),
+        vaddr as u32 | (vdata as u32) << 8 | (saddr as u32) << 16,
+    ]
+}
+
+/// The first-lane read of a `global_load_dword*`'s result is refused
+/// (`FIRST_ACROSS`) in a divergent block.
+fn refused_in_halves(w: &[u32]) -> bool {
+    let first_across = super::halves::FIRST_ACROSS;
+    matches!(lower_halves(w), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across)
+}
+
+/// A `global_load_dword` at an address every lane of the console wave holds
+/// alike, in a divergent block whose active lanes are in both halves (a
+/// branch true everywhere but lane 5, and a `v_writelane_b32` into the
+/// upper half): the first-lane read of it is observable (branched on) and
+/// still needs no cross-half exchange.
+#[test]
+fn a_uniform_global_load_read_first_with_lanes_active_in_both_halves() {
+    let mut w = vec![0x7E02_02FF, 0x0000_1000]; // v_mov_b32 v1, 0x1000
+    w.extend(global(0x0C, 2, 1, 0, 0)); // global_load_dword v2, v1, s[0:1], 0
+    w.extend(WRITELANE_V4_V1_5); // v_writelane_b32 v4, v1, 5
+    w.extend([0xD761_0005, 0x0001_5101]); // v_writelane_b32 v5, v1, 40 (the upper half)
+    w.extend([0x7DAA_0085, skip(3)]); // v_cmpx_ne_u32 exec, 5, v0; s_cbranch_scc1
+    w.extend([0x7E0C_0502, 0xBF07_8006, 0xBF85_0001]); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0; s_cbranch_scc1
+    w.extend([0xBE87_0380, S_ENDPGM]); // s_mov_b32 s7, 0; s_endpgm
+    let l =
+        lower_halves(&w).expect("a uniform global load lowers with lanes active in both halves");
+    assert_eq!(l.wave_size, Some(32), "the console wave ran as two halves");
+    assert_eq!(
+        l.shape.barriers, 0,
+        "no cross-half exchange was emitted for the observable first-lane read"
+    );
+}
+
+/// The last destination word of a `global_load_dwordx2`, `x3` or `x4` at an
+/// alike address is one value in every lane too: its first-lane read in a
+/// divergent block lowers without a cross-half exchange.
+#[test]
+fn a_uniform_global_loads_last_word_of_x2_x3_x4_needs_no_exchange() {
+    // op, the read of the last destination word (s6, v6+N-1).
+    for (op, last) in [
+        (0x0D, 0x7E0C_0507), // global_load_dwordx2 v[6:7]; v_readfirstlane_b32 s6, v7
+        (0x0F, 0x7E0C_0508), // global_load_dwordx3 v[6:8]; v_readfirstlane_b32 s6, v8
+        (0x0E, 0x7E0C_0509), // global_load_dwordx4 v[6:9]; v_readfirstlane_b32 s6, v9
+    ] {
+        let mut w = vec![0x7E02_02FF, 0x0000_1000]; // v_mov_b32 v1, 0x1000
+        w.extend(global(op, 6, 1, 0, 0));
+        divergent_read(&mut w, last, 0xBF07_8006); // s_cmp_lg_u32 s6, 0
+        let l = lower_halves(&w).unwrap_or_else(|e| panic!("global_load_dwordx op {op:#x}: {e}"));
+        assert_eq!(l.wave_size, Some(32));
+        assert_eq!(
+            l.shape.barriers, 0,
+            "no cross-half exchange for the last word of op {op:#x}"
+        );
+    }
+}
+
+/// Equal addresses do not prove equal load results where memory can be
+/// written: a `global_store_dword` in the same shader (here at the loaded
+/// address) means the console wave's two host waves can reach the load on
+/// opposite sides of another lane's store, so the load is not lane-uniform
+/// and its first-lane read in a divergent block keeps the refusal.
+#[test]
+fn an_aliasing_global_store_keeps_the_first_lane_refusal() {
+    let mut w = vec![0x7E02_02FF, 0x0000_1000]; // v_mov_b32 v1, 0x1000
+    w.extend([0x7E04_02FF, 0x0000_0777]); // v_mov_b32 v2, 0x777
+    w.extend(global_store(2, 1, 0, 0)); // global_store_dword v2, v1, s[0:1], 0
+    w.extend(global(0x0C, 3, 1, 0, 0)); // global_load_dword v3, v1, s[0:1], 0
+    divergent_read(&mut w, 0x7E0E_0503, 0xBF07_8007); // v_readfirstlane_b32 s7, v3; s_cmp_lg_u32 s7, 0
+    assert!(
+        refused_in_halves(&w),
+        "an aliasing global store keeps the refusal"
+    );
+}
+
+/// A root SRV and a root UAV can bind the same title-memory address, so a
+/// `global_store_dword` through the root UAV can alias a `global_load_dword`
+/// through the root SRV: the load is not lane-uniform, and its first-lane
+/// read in a divergent block keeps the refusal.
+#[test]
+fn a_root_srv_load_with_a_root_uav_store_keeps_the_first_lane_refusal() {
+    // s[0:1]: the root SRV's address; s[2:3]: the root UAV's address.
+    let srv = root(RootType::Descriptor, 0, 0);
+    let uav = RootParam {
+        sgprs: 2,
+        ..root(RootType::Descriptor, 2, 1)
+    };
+    let used = vec![
+        UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        },
+        UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 2,
+            slot: 1,
+        },
+    ];
+    let mut w = vec![
+        0x7E02_02FF,
+        0x0000_1000, // v_mov_b32 v1, 0x1000
+        0x7E04_02FF,
+        0x0000_0777, // v_mov_b32 v2, 0x777
+    ];
+    w.extend(global_store(2, 1, 2, 0)); // global_store_dword v2, v1, s[2:3], 0 (the root UAV)
+    w.extend(global(0x0C, 3, 1, 0, 0)); // global_load_dword v3, v1, s[0:1], 0 (the root SRV)
+    divergent_read(&mut w, 0x7E0E_0503, 0xBF07_8007); // v_readfirstlane_b32 s7, v3; s_cmp_lg_u32 s7, 0
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower_halves_with(&w, vec![srv, uav], used), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "a root SRV a root UAV store can alias keeps the refusal"
+    );
+}
+
+/// A `buffer_atomic_add` writes title memory a `global_load_dword` can read,
+/// so the load is not lane-uniform: its first-lane read in a divergent block
+/// keeps the refusal.
+#[test]
+fn a_buffer_atomic_with_a_global_load_keeps_the_first_lane_refusal() {
+    // s[0:3]: root constants; s[4:5]: the root table the buffer's descriptor
+    // is loaded from into s[8:11].
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let mut w = vec![
+        0x7E02_02FF,
+        0x0000_1000, // v_mov_b32 v1, 0x1000
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xFA00_0000,
+        0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+        0xE0C8_1000, // buffer_atomic_add v2, v1, s[8:11], 0 offen
+        0x8002_0201,
+    ];
+    w.extend(global(0x0C, 3, 1, 0, 0)); // global_load_dword v3, v1, s[0:1], 0
+    divergent_read(&mut w, 0x7E0E_0503, 0xBF07_8007); // v_readfirstlane_b32 s7, v3; s_cmp_lg_u32 s7, 0
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "a global load a buffer atomic can alias keeps the refusal"
+    );
+}
+
+/// A `buffer_atomic_add` at the same UAV byte offset a `buffer_load_dword`
+/// reads can be observed at different stages by the console wave's two host
+/// halves — one half can reach the load on the other side of the atomic —
+/// so the load's result is not the same in every lane of the console wave:
+/// its first-lane read in a divergent block keeps the refusal. The load's
+/// descriptor is a root one held in SGPRs (s[0:1] the root descriptor's
+/// address, s2/s3 constants), so every register it reads is positively
+/// proven uniform and only the atomic's aliasing keeps the refusal; without
+/// the atomic the same load translates with no cross-half exchange.
+#[test]
+fn a_buffer_load_aliased_by_a_buffer_atomic_keeps_the_first_lane_refusal() {
+    // s[0:1]: the root UAV descriptor's 64-bit address; s2/s3: the rest of
+    // the buffer descriptor the load and atomic take as srsrc s[0:3].
+    let uav = root(RootType::Descriptor, 0, 0);
+    let buffer = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    let head = [
+        0xBE82_0380, // s_mov_b32 s2, 0 (srsrc dword 2)
+        0xBE83_0380, // s_mov_b32 s3, 0 (srsrc dword 3)
+        0x7E02_02FF,
+        0x0000_0000, // v_mov_b32 v1, 0 (the load's and the atomic's byte offset)
+        0xE030_1000,
+        0x8000_0201, // buffer_load_dword v2, v1, s[0:3], 0 offen
+    ];
+    // With the atomic at the same UAV dword: the load can be observed on
+    // opposite sides of it in the two host halves, so it is not lane-uniform.
+    let mut w = Vec::from(head);
+    w.extend([
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E06_02FF,
+        0x0000_0001, // v_mov_b32 v3, 1 (non-zero addend so the atomic modifies the dword)
+        0xE0C8_1000,
+        0x8000_0301, // buffer_atomic_add v3, v1, s[0:3], 0 offen (the same UAV dword)
+    ]);
+    divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower_halves_with(&w, vec![uav], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "a buffer load a buffer atomic at the same UAV offset can alias keeps the refusal"
+    );
+    // Without the atomic: no write the shader performs can alias the load,
+    // and every register it reads is proven uniform (the root descriptor's
+    // SGPRs, the constants, the constant VGPR offset), so the load is
+    // lane-uniform and its first-lane read needs no cross-half exchange.
+    let mut w = Vec::from(head);
+    divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
+    let l = lower_halves_with(&w, vec![uav], vec![buffer])
+        .expect("a buffer load with a proven root descriptor and no aliasing atomic lowers in halves");
+    assert_eq!(l.wave_size, Some(32), "the console wave ran as two halves");
+    assert_eq!(
+        l.shape.barriers, 0,
+        "no cross-half exchange was emitted for the proven-descriptor load"
+    );
+}
+
+/// A `buffer_load_dword`'s scalar offset (`soffset`) is an `s_load_dword`'s
+/// result, which is not whitelisted ([`SCALAR_ALOP`]) and so has no positive
+/// proof of uniformity ([`same_s`]): the two host halves can read different
+/// stages of the memory the `s_load_dword` read, so the buffer offset — and
+/// with it the loaded dword — can differ between them. The first-lane read
+/// of the load's result in a divergent block keeps the refusal. The load's
+/// descriptor is a root one held in SGPRs (s[0:1] the root descriptor's
+/// address, s2/s3 constants), so only the unproven `soffset` keeps the
+/// refusal; with a proven root-constant `soffset` (s4) the same load
+/// translates with no cross-half exchange.
+#[test]
+fn a_buffer_load_with_an_s_load_soffset_keeps_the_first_lane_refusal() {
+    // s[0:1]: the root SRV descriptor's 64-bit address (s2/s3 the rest of
+    // srsrc s[0:3]); s[4:7]: root constants (s[4:5] the s_load's base, s4 a
+    // proven soffset).
+    let srv = root(RootType::Descriptor, 0, 0);
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 4, 1)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    let head = [
+        0xBE82_0380, // s_mov_b32 s2, 0 (srsrc dword 2)
+        0xBE83_0380, // s_mov_b32 s3, 0 (srsrc dword 3)
+        0x7E02_02FF,
+        0x0000_0000, // v_mov_b32 v1, 0 (the load's index)
+    ];
+    // With the `s_load_dword`-derived soffset s8: unproven, so the load is
+    // not lane-uniform.
+    let mut w = Vec::from(head);
+    w.extend([
+        0xF400_0202,
+        0xFA00_0040, // s_load_dword s8, s[4:5], 0x40 (an unproven scalar read)
+        0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+        0xE030_1000,
+        0x0800_0201, // buffer_load_dword v2, v1, s[0:3], s8 offen
+    ]);
+    divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower_halves_with(&w, vec![srv, constants], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "a buffer load with an s_load_dword-derived soffset keeps the refusal"
+    );
+    // With the root-constant soffset s4 (in [`same_s`] from entry): proven,
+    // so the load is lane-uniform and its first-lane read needs no
+    // cross-half exchange.
+    let mut w = Vec::from(head);
+    w.extend([
+        0xE030_1000,
+        0x0400_0201, // buffer_load_dword v2, v1, s[0:3], s4 offen
+    ]);
+    divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
+    let l = lower_halves_with(&w, vec![srv, constants], vec![buffer])
+        .expect("a buffer load with a proven root descriptor and root-constant soffset lowers in halves");
+    assert_eq!(l.wave_size, Some(32), "the console wave ran as two halves");
+    assert_eq!(
+        l.shape.barriers, 0,
+        "no cross-half exchange was emitted for the proven-soffset load"
+    );
+}
+
+/// An overlapping `buffer_load_dword v1, v1, s[0:3], 0 offen` reads its
+/// destination as the address (`vaddr`) too: with a lane-varying `v1` (the
+/// thread id) the loaded dword differs between lanes, so the result is not
+/// the same in every lane of the console wave and its first-lane read in a
+/// divergent block keeps the refusal. The descriptor is a root one held in
+/// SGPRs (proven uniform); with a uniform `v1` the overlapping load
+/// translates with no cross-half exchange.
+#[test]
+fn an_overlapping_buffer_load_with_a_lane_varying_vaddr_keeps_the_first_lane_refusal() {
+    // s[0:1]: the root SRV descriptor's 64-bit address; s2/s3: the rest of
+    // the buffer descriptor the load takes as srsrc s[0:3].
+    let srv = root(RootType::Descriptor, 0, 0);
+    let buffer = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    let head = |v1: &[u32]| {
+        let mut w = vec![
+            0xBE82_0380, // s_mov_b32 s2, 0 (srsrc dword 2)
+            0xBE83_0380, // s_mov_b32 s3, 0 (srsrc dword 3)
+        ];
+        w.extend_from_slice(v1);
+        w.extend([
+            0xE030_1000,
+            0x8000_0101, // buffer_load_dword v1, v1, s[0:3], 0 offen (dst == vaddr)
+        ]);
+        w
+    };
+    // The address/destination v1 is the thread id: lane-varying, so the
+    // load is not lane-uniform.
+    let mut w = head(&[0x7E02_0300]); // v_mov_b32 v1, v0
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006); // v_readfirstlane_b32 s6, v1; s_cmp_lg_u32 s6, 0
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower_halves_with(&w, vec![srv], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "an overlapping buffer load with a lane-varying vaddr keeps the refusal"
+    );
+    // The same overlapping load with a uniform v1: the address is proven
+    // uniform, so the load is lane-uniform and needs no cross-half exchange.
+    let mut w = head(&[0x7E02_02FF, 0x0000_0000]); // v_mov_b32 v1, 0
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006); // v_readfirstlane_b32 s6, v1; s_cmp_lg_u32 s6, 0
+    let l = lower_halves_with(&w, vec![srv], vec![buffer])
+        .expect("an overlapping buffer load with a uniform vaddr lowers in halves");
+    assert_eq!(l.wave_size, Some(32), "the console wave ran as two halves");
+    assert_eq!(
+        l.shape.barriers, 0,
+        "no cross-half exchange was emitted for the uniform overlapping load"
+    );
+}
+
+/// A `ds_read_u16_d16` writes only the low half of its destination VGPR and
+/// keeps the old high half as live data: with a lane-varying old
+/// destination (the thread id) the result is lane-varying too, so it is not
+/// the same in every lane of the console wave and its first-lane read in a
+/// divergent block keeps the refusal. With a uniform old destination the
+/// load is lane-uniform and translates with no cross-half exchange. (The
+/// group is two console waves, so LDS keeps its barriers in halves and only
+/// the value analysis can refuse.)
+#[test]
+fn a_ds_read_u16_d16_into_a_lane_varying_destination_keeps_the_first_lane_refusal() {
+    // 512 bytes of LDS in a group of 128 threads.
+    let lower = |w: &[u32]| {
+        lower_halves_io(
+            w,
+            vec![RootParam {
+                sgprs: 4,
+                ..root(RootType::Constants, 0, 0)
+            }],
+            vec![],
+            1 << 15 | 4 << 1,
+            [128, 1, 1],
+        )
+    };
+    let head = |v1: &[u32]| {
+        let mut w = Vec::from(v1);
+        w.extend([
+            0x7E04_02FF,
+            0x0000_1000, // v_mov_b32 v2, 0x1000 (uniform out-of-bounds LDS address)
+            0xDA98_0000,
+            0x0100_0002, // ds_read_u16_d16 v1, v2 offset:0 (keeps the old high half of v1)
+        ]);
+        w
+    };
+    // The old destination v1 holds tid << 16: lane-varying in its preserved
+    // high 16 bits, so the _d16 load's result is lane-varying.
+    let mut w = head(&[0x3402_0090]); // v_lshlrev_b32 v1, 16, v0
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006); // v_readfirstlane_b32 s6, v1; s_cmp_lg_u32 s6, 0
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower(&w), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "a ds_read_u16_d16 into a lane-varying destination keeps the refusal"
+    );
+    // The same load with a uniform old destination: proven uniform, so the
+    // load is lane-uniform and needs no cross-half exchange.
+    let mut w = head(&[0x7E02_02FF, 0x0000_0000]); // v_mov_b32 v1, 0
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006); // v_readfirstlane_b32 s6, v1; s_cmp_lg_u32 s6, 0
+    let l = lower(&w).expect("a ds_read_u16_d16 into a uniform destination lowers in halves");
+    assert_eq!(l.wave_size, Some(32), "the console wave ran as two halves");
+    assert_eq!(
+        l.shape.barriers, 0,
+        "no cross-half exchange was emitted for the uniform-destination _d16 read"
+    );
+}
+
+/// A `global_load_dword` from the code's own table stays lane-uniform even
+/// where the shader performs stores that could alias other loads (here a
+/// `global_store_dword`): the first-lane read of it in a divergent block
+/// needs no cross-half exchange.
+#[test]
+fn a_global_load_from_the_code_table_stays_uniform_with_a_store_present() {
+    let mut w = vec![
+        0xBE80_1F00, // s_getpc_b64 s[0:1] (the code's table base)
+        0x7E02_02FF,
+        0x0000_0000, // v_mov_b32 v1, 0 (the code table sits right after the code)
+        0x7E04_02FF,
+        0x0000_0777, // v_mov_b32 v2, 0x777
+    ];
+    w.extend(global_store(2, 1, 2, 0)); // global_store_dword v2, v1, s[2:3], 0
+    w.extend(global(0x0C, 3, 1, 0, 0x40)); // global_load_dword v3, v1, s[0:1], 0x40 (the code table)
+    divergent_read(&mut w, 0x7E0E_0503, 0xBF07_8007); // v_readfirstlane_b32 s7, v3; s_cmp_lg_u32 s7, 0
+    let l = lower_halves(&w).expect("a load from the code's table stays lane-uniform with a store present");
+    assert_eq!(l.wave_size, Some(32));
+    assert_eq!(
+        l.shape.barriers, 0,
+        "no cross-half exchange was emitted for the code table's load"
+    );
+}
+
+/// Where the shader also stores (here a `global_store_dword`), a
+/// `buffer_load_dword` result is not lane-uniform: the console wave's two
+/// host waves can observe the store to the loaded buffer at different times
+/// and load different dwords. As the VGPR offset of a code-table
+/// `global_load_dword` it would let each half read a different code entry
+/// while a `v_readfirstlane_b32` of the result skips the cross-half
+/// exchange: the first-lane read in a divergent block keeps its refusal.
+#[test]
+fn a_buffer_load_offset_to_code_with_a_store_keeps_the_first_lane_refusal() {
+    // s[0:3]: root constants (s[2:3] the store's address); s[4:5]: the root
+    // table the buffer's descriptor is loaded from into s[8:11].
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let mut w = vec![
+        0xBE80_1F00, // s_getpc_b64 s[0:1] (the code's table base)
+        0x7E02_02FF,
+        0x0000_0000, // v_mov_b32 v1, 0 (the buffer load's address)
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+        0xE030_1000,
+        0x8002_0201, // buffer_load_dword v2, v1, s[8:11], 0 offen
+        0x7E06_02FF,
+        0x0000_0777, // v_mov_b32 v3, 0x777
+    ];
+    w.extend(global_store(3, 1, 2, 0)); // global_store_dword v3, v1, s[2:3], 0
+    w.extend(global(0x0C, 5, 2, 0, 0x40)); // global_load_dword v5, v2, s[0:1], 0x40 (the code table)
+    divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
+    w.extend([0x1111_1111, 0x2222_2222]); // the code's constant table, past the instructions
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "a buffer-load offset into the code table with a store present keeps the refusal"
+    );
+}
+
+/// A phi selecting between two constants counts only where every lane of
+/// both halves reaches its block together. Here the branch choosing between
+/// the constants tests a `buffer_load_dword` result, which is not
+/// lane-uniform where the shader stores (here a `global_store_dword` is
+/// present) — the two host halves can observe a store to the loaded buffer
+/// at different times and take different sides — so the phi can pick a
+/// different constant in each half. As the VGPR offset of a code-table
+/// `global_load_dword`, each half would then read a different code entry
+/// while a first-lane read of the load's result skips the cross-half
+/// exchange: the first-lane read in a divergent block keeps its refusal.
+#[test]
+fn a_phi_over_a_load_controlled_branch_keeps_the_first_lane_refusal() {
+    // s[0:3]: root constants (s[2:3] the store's address); s[4:5]: the root
+    // table the buffer's descriptor is loaded from into s[8:11].
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let mut w = vec![
+        0xBE80_1F00, // s_getpc_b64 s[0:1] (the code's table base)
+        0x7E02_02FF,
+        0x0000_0000, // v_mov_b32 v1, 0 (the buffer load's address)
+        0x7E0C_02FF,
+        0x0000_0777, // v_mov_b32 v6, 0x777 (the store's data)
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+        0xE030_1000,
+        0x8002_0201, // buffer_load_dword v2, v1, s[8:11], 0 offen
+        0x7E06_02FF,
+        0x0000_0011, // v_mov_b32 v3, 0x11 (the phi's first constant)
+        0x7D84_0480, // v_cmp_eq_u32 vcc_lo, 0, v2 (the load controls the branch)
+        0xBF86_0002, // s_cbranch_vccz -> the merge (over the second constant)
+        0x7E06_02FF,
+        0x0000_0022, // v_mov_b32 v3, 0x22 (the phi's second constant)
+    ];
+    w.extend(global_store(6, 1, 2, 0)); // global_store_dword v6, v1, s[2:3], 0
+    w.extend(global(0x0C, 5, 3, 0, 0x40)); // global_load_dword v5, v3 (the phi), s[0:1], 0x40 (the code table)
+    divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
+    w.extend([0x1111_1111, 0x2222_2222]); // the code's constant table, past the instructions
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "a phi over a load-controlled branch with a store present keeps the refusal"
+    );
+}
+
+/// A `buffer_load_dword` comparison is not alike where the shader stores
+/// (here a `global_store_dword` is present): the two host halves can
+/// observe a store to the loaded buffer at different times and compute
+/// different carries. If it narrows EXEC around a code-table
+/// `global_load_dword`, one half can take the load while the other keeps
+/// the old value, so the guarded load must not enter `same` and a
+/// first-lane read after EXEC is restored keeps its refusal.
+#[test]
+fn a_code_load_under_a_buffer_load_guard_keeps_the_first_lane_refusal() {
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let mut w = vec![
+        0xBE80_1F00, // s_getpc_b64 s[0:1] (the code's table base)
+        0x7E02_02FF,
+        0x0000_0000, // v_mov_b32 v1, 0 (the buffer load's and code load's offset)
+        0x7E0A_02FF,
+        0x0000_0000, // v_mov_b32 v5, 0 (pure old value of destination)
+        0x7E0C_02FF,
+        0x0000_0777, // v_mov_b32 v6, 0x777 (the store's data)
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+        0xE030_1000,
+        0x8002_0201, // buffer_load_dword v2, v1, s[8:11], 0 offen
+        0x7D84_0480, // v_cmp_eq_u32 vcc, 0, v2 (not lane-uniform with a store present)
+        0xBE90_246A, // s_and_saveexec_b64 s[16:17], vcc
+    ];
+    w.extend(global_store(6, 1, 2, 0)); // global_store_dword v6, v1, s[2:3], 0
+    w.extend(global(0x0C, 5, 1, 0, 0x40)); // guarded global_load_dword v5, v1, s[0:1], 0x40
+    w.push(0xBEFE_0410); // s_mov_b64 exec, s[16:17]
+    divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
+    w.extend([0x1111_1111, 0x2222_2222]); // the code's constant table, past the instructions
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "a code-table load under a buffer-load guard with a store present keeps the refusal"
+    );
+}
+
+/// `v_dot4c_i32_i8` accumulates into its destination register, so an old
+/// destination loaded from a buffer must be alike for the result to be:
+/// where the shader stores (here a `global_store_dword` is present) the
+/// `buffer_load_dword` result is not lane-uniform, so the dot4c's result is
+/// not either, and the code-table load at its offset is not lane-uniform.
+#[test]
+fn a_dot4c_accumulator_from_a_buffer_load_keeps_the_first_lane_refusal() {
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let mut w = vec![
+        0xBE80_1F00, // s_getpc_b64 s[0:1] (the code's table base)
+        0x7E02_02FF,
+        0x0000_0000, // v_mov_b32 v1, 0
+        0x7E06_02FF,
+        0x0000_0000, // v_mov_b32 v3, 0 (pure src0)
+        0x7E08_02FF,
+        0x0000_0000, // v_mov_b32 v4, 0 (pure src1)
+        0x7E0C_02FF,
+        0x0000_0777, // v_mov_b32 v6, 0x777 (the store's data)
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+        0xE030_1000,
+        0x8002_0201, // buffer_load_dword v2, v1, s[8:11], 0 offen (not lane-uniform with a store present)
+        0x1A04_0903, // v_dot4c_i32_i8 v2, v3, v4 (reads old v2 as accumulator)
+    ];
+    w.extend(global_store(6, 1, 2, 0)); // global_store_dword v6, v1, s[2:3], 0
+    w.extend(global(0x0C, 5, 2, 0, 0x40)); // global_load_dword v5, v2, s[0:1], 0x40
+    divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
+    w.extend([0x1111_1111, 0x2222_2222]);
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "a v_dot4c_i32_i8 with a buffer-loaded accumulator must not enter pure"
+    );
+}
+
+/// A 64-bit VALU op reads both dwords of its scalar operand, so a pure one
+/// needs both in `same_s`: here `v_lshlrev_b64`'s high word is an
+/// `s_load_dword` result (unproven), which the operand's low word alone
+/// would not check. As the VGPR offset of a code-table `global_load_dword`
+/// with a store present the shift's result must not count as pure: the
+/// first-lane read in a divergent block keeps its refusal.
+#[test]
+fn a_64bit_shift_with_an_unproven_high_scalar_keeps_the_first_lane_refusal() {
+    // s[0:7]: root constants (s[0:1] overwritten by s_getpc with the code's
+    // table base, s[2:3] the store's address, s6 the shift's low word).
+    let constants = RootParam {
+        sgprs: 8,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let mut w = vec![
+        0xBE80_1F00, // s_getpc_b64 s[0:1] (the code's table base)
+        0xF400_01C1,
+        0xFA00_0040, // s_load_dword s7, s[2:3], 0x40 (an unproven scalar read)
+        0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+        0xD6FF_0004,
+        0x0000_0C86, // v_lshlrev_b64 v[4:5], 6, s[6:7] (the high word unproven)
+        0x7E02_02FF,
+        0x0000_0000, // v_mov_b32 v1, 0 (the store's address)
+        0x7E0C_02FF,
+        0x0000_0777, // v_mov_b32 v6, 0x777 (the store's data)
+    ];
+    w.extend(global_store(6, 1, 2, 0)); // global_store_dword v6, v1, s[2:3], 0
+    w.extend(global(0x0C, 5, 4, 0, 0x40)); // global_load_dword v5, v4, s[0:1], 0x40 (the code table)
+    divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
+    w.extend([0x1111_1111, 0x2222_2222]); // the code's constant table, past the instructions
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower_halves_with(&w, vec![constants], vec![]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "a 64-bit shift with an unproven high scalar word keeps the refusal"
+    );
+}
+
+/// An unproven scalar base word copied through `s_mov_b32` carries its data
+/// in a new SSA value the copy does not prove uniform — an `s_load_dword`'s
+/// result is a memory read, which is not whitelisted, and a waterfall loop's
+/// reads are each lane's own — so the load at that base is not lane-uniform
+/// and its first-lane read in a divergent block keeps the refusal.
+#[test]
+fn a_copied_unproven_base_word_keeps_the_first_lane_refusal() {
+    let mut w = vec![
+        0x7E02_02FF,
+        0x0000_1000, // v_mov_b32 v1, 0x1000
+        0xF400_0080, // s_load_dword s2, s[0:1], 0x40 (an unproven scalar read)
+        0xFA00_0040,
+        0xBE84_0302, // s_mov_b32 s4, s2 (the copy)
+        0xBE85_0380, // s_mov_b32 s5, 0
+    ];
+    w.extend(global(0x0C, 2, 1, 4, 0)); // global_load_dword v2, v1, s[4:5], 0
+    divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
+    assert!(
+        refused_in_halves(&w),
+        "a copied unproven base word keeps the refusal"
+    );
+    // The same with the copy's source a first-lane read of the thread id:
+    // in halves each host wave reads its own first lane, so the source holds
+    // per-lane data, and the copy does not prove it uniform either.
+    let mut w = vec![0x7E02_02FF, 0x0000_1000]; // v_mov_b32 v1, 0x1000
+    w.push(0x7E04_0500); // v_readfirstlane_b32 s2, v0 (the host wave's first thread id)
+    w.push(0xBE84_0302); // s_mov_b32 s4, s2 (the copy)
+    w.push(0xBE85_0380); // s_mov_b32 s5, 0
+    w.extend(global(0x0C, 2, 1, 4, 0)); // global_load_dword v2, v1, s[4:5], 0
+    divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
+    assert!(
+        refused_in_halves(&w),
+        "a copied first-lane read keeps the refusal"
+    );
+}
+
+/// A `global_load_dword` under a lane-dependent guard runs only in some
+/// lanes of each half, so its result is not one value per console wave: the
+/// first-lane read of it in a divergent block keeps the refusal.
+#[test]
+fn a_lane_dependent_load_guard_keeps_the_first_lane_refusal() {
+    let mut w = vec![0x7E02_02FF, 0x0000_1000]; // v_mov_b32 v1, 0x1000
+    w.extend(WRITELANE_V4_V1_5);
+    w.extend([CMPX_V0_EQ_0, skip(5)]);
+    w.extend(global(0x0C, 2, 1, 0, 0)); // global_load_dword v2, v1, s[0:1], 0 (under the guard)
+    w.extend([0x7E0C_0502, 0xBF07_8006, 0xBF85_0001]); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0; s_cbranch_scc1
+    w.extend([0xBE87_0380, S_ENDPGM]); // s_mov_b32 s7, 0; s_endpgm
+    assert!(
+        refused_in_halves(&w),
+        "a lane-dependent load guard keeps the refusal"
+    );
+}
+
+/// A `global_load_dword` with a `glc` or `slc` cache flag can observe a
+/// per-lane write through the cache, so it is not lane-uniform: its
+/// first-lane read in a divergent block keeps the refusal.
+#[test]
+fn glc_and_slc_global_loads_keep_the_first_lane_refusal() {
+    for (bit, what) in [(16, "glc"), (17, "slc")] {
+        let mut w = vec![0x7E02_02FF, 0x0000_1000]; // v_mov_b32 v1, 0x1000
+        let mut g = global(0x0C, 2, 1, 0, 0);
+        g[0] |= 1 << bit;
+        w.extend(g); // global_load_dword v2, v1, s[0:1], 0 with the cache flag
+        divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
+        assert!(
+            refused_in_halves(&w),
+            "a {what} global load keeps the refusal"
+        );
+    }
+}
+
+/// A `v_cndmask_b32` reads its select mask per lane (bit `lane_id` of the
+/// 64-bit mask), so an inline mask of `1` — or a uniform root SGPR mask,
+/// whose scalar value is one value but whose per-lane bit is not — selects
+/// different sources for lane 0 than for lanes 1..63. As the VGPR offset of
+/// a code-table `global_load_dword` with a store present (where the offset
+/// must be pure), each half would read a different code entry while a
+/// `v_readfirstlane_b32` of the load's result skips the cross-half
+/// exchange: the first-lane read in a divergent block keeps its refusal.
+#[test]
+fn a_cndmask_with_a_per_lane_mask_bit_keeps_the_first_lane_refusal() {
+    // s[0:1]: the code's table base (s_getpc); s[2:3]: root constants (the
+    // store's address).
+    let head = [
+        0xBE80_1F00, // s_getpc_b64 s[0:1] (the code's table base)
+        0x7E02_02FF,
+        0x0000_0000, // v_mov_b32 v1, 0 (the store's address)
+        0x7E04_02FF,
+        0x0000_0777, // v_mov_b32 v2, 0x777 (the store's data)
+    ];
+    // v_cndmask_b32 v3, 0, 0x40, <mask> (VOP3 opcode 0x101: the third source
+    // is the 64-bit mask).
+    let cndmask = |mask: u32| [0xD501_0003, 128 | 192 << 9 | mask << 18];
+    let tail = |w: &mut Vec<u32>, cnd: [u32; 2]| {
+        w.extend(head);
+        w.extend(cnd);
+        w.extend(global_store(2, 1, 2, 0)); // global_store_dword v2, v1, s[2:3], 0
+        w.extend(global(0x0C, 5, 3, 0, 0x40)); // global_load_dword v5, v3, s[0:1], 0x40 (the code table)
+        divergent_read(w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
+        w.extend([0x1111_1111, 0x2222_2222]); // the code's constant table
+    };
+    // An inline mask of 1: lane 0 takes 0x40, lanes 1..63 take 0.
+    let mut w = Vec::new();
+    tail(&mut w, cndmask(129)); // inline constant 1
+    assert!(
+        refused_in_halves(&w),
+        "an inline mask of 1 keeps the first-lane refusal"
+    );
+    // A root SGPR mask s[2:3]: one scalar value, but bit `lane_id` per lane.
+    let mut w = Vec::new();
+    tail(&mut w, cndmask(2)); // s[2:3]
+    assert!(
+        refused_in_halves(&w),
+        "a root SGPR select mask keeps the first-lane refusal"
+    );
+    // An all-ones mask selects the same source in every lane: no refusal.
+    let mut w = Vec::new();
+    tail(&mut w, cndmask(193)); // inline constant -1
+    let l = lower_halves(&w)
+        .expect("an all-ones select mask stays lane-uniform with a store present");
+    assert_eq!(l.wave_size, Some(32), "the console wave ran as two halves");
+    assert_eq!(
+        l.shape.barriers, 0,
+        "no cross-half exchange was emitted for the all-ones mask"
+    );
+    // A VOP2 `v_cndmask_b32` on VCC from a compare of alike values: the
+    // mask's per-lane bit is the same in every lane, so no refusal either.
+    let mut w = vec![
+        0x7E0A_02FF,
+        0x0000_0040, // v_mov_b32 v5, 0x40
+        0x7E0C_02FF,
+        0x0000_0000, // v_mov_b32 v6, 0
+        0x7D84_0C80, // v_cmp_eq_u32 vcc, 0, v6 (alike operands)
+        0x0206_0A80, // v_cndmask_b32 v3, 0, v5, vcc (VOP2: the implicit VCC)
+    ];
+    w.extend(global(0x0C, 2, 3, 0, 0)); // global_load_dword v2, v3, s[0:1], 0
+    divergent_read(&mut w, 0x7E0C_0502, 0xBF07_8006); // v_readfirstlane_b32 s6, v2; s_cmp_lg_u32 s6, 0
+    let l = lower_halves(&w)
+        .expect("a VOP2 cndmask on an alike compare's VCC stays lane-uniform");
+    assert_eq!(l.wave_size, Some(32), "the console wave ran as two halves");
+    assert_eq!(
+        l.shape.barriers, 0,
+        "no cross-half exchange was emitted for the alike-compare VCC mask"
+    );
+}
+
+/// A `v_dot4c_i32_i8` reads its destination as an implicit accumulator (in
+/// `inst.reads`, though not among its operands): with a lane-varying old
+/// destination (the thread id) and zero inputs it preserves the
+/// lane-varying value, so its result is not the same in every lane. As the
+/// VGPR offset of a `global_load_dword` in a shader without stores (where
+/// the offset only needs to be lane-uniform), each half would load from a
+/// different address while a `v_readfirstlane_b32` of the result skips the
+/// cross-half exchange: the first-lane read in a divergent block keeps its
+/// refusal.
+#[test]
+fn a_dot4c_with_a_lane_varying_accumulator_keeps_the_first_lane_refusal() {
+    // v_dot4c_i32_i8 v1, v2, v3 (VOP2 opcode 0x00d): v1 = old v1 + dot4(v2, v3).
+    const DOT4C_V1_V2_V3: u32 = 0x1A02_0702;
+    // The old v1 is the thread id: lane-varying.
+    let mut w = vec![
+        0x7E02_0300, // v_mov_b32 v1, v0 (the thread id)
+        0x7E04_02FF,
+        0x0000_0000, // v_mov_b32 v2, 0
+        0x7E06_02FF,
+        0x0000_0000, // v_mov_b32 v3, 0
+        DOT4C_V1_V2_V3,
+    ];
+    w.extend(global(0x0C, 5, 1, 0, 0)); // global_load_dword v5, v1, s[0:1], 0
+    divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
+    assert!(
+        refused_in_halves(&w),
+        "a v_dot4c_i32_i8 over a lane-varying accumulator keeps the refusal"
+    );
+    // The same with a uniform old destination (0): the result is 0 in every
+    // lane, so the load is lane-uniform and the first-lane read of it needs
+    // no cross-half exchange.
+    let mut w = vec![
+        0x7E02_02FF,
+        0x0000_0000, // v_mov_b32 v1, 0 (a uniform old accumulator)
+        0x7E04_02FF,
+        0x0000_0000, // v_mov_b32 v2, 0
+        0x7E06_02FF,
+        0x0000_0000, // v_mov_b32 v3, 0
+        DOT4C_V1_V2_V3,
+    ];
+    w.extend(global(0x0C, 5, 1, 0, 0)); // global_load_dword v5, v1, s[0:1], 0
+    divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
+    let l = lower_halves(&w)
+        .expect("a v_dot4c_i32_i8 over a uniform accumulator lowers in halves");
+    assert_eq!(l.wave_size, Some(32), "the console wave ran as two halves");
+    assert_eq!(
+        l.shape.barriers, 0,
+        "no cross-half exchange was emitted for the uniform accumulator"
+    );
+}
+
+/// An `s_load_dword` that can alias a store (`global_store_dword` at the same
+/// address) reads memory whose stages the console wave's two host halves can
+/// observe differently, so its result has no positive proof of uniformity
+/// (not in [`same_s`]). An `s_cmp_*` of it writes an SCC that can differ
+/// between the halves, and a `v_mov_b32 ..., src_scc` of that carry is one
+/// value per host wave, not per console wave: a `v_readfirstlane_b32` of it
+/// in a divergent block keeps its first-lane refusal.
+#[test]
+fn an_scc_from_an_aliasing_s_load_keeps_the_first_lane_refusal() {
+    // s[0:3]: root constants (s[0:1] the s_load's and the store's base).
+    let mut w = vec![
+        0xF400_0080, 0xFA00_0040, // s_load_dword s2, s[0:1], 0x40 (can alias the store)
+        0xBF8C_0000,              // s_waitcnt lgkmcnt(0)
+        0xBF06_8002,              // s_cmp_eq_u32 s2, 0 (writes SCC from the load)
+        0x7E02_02FD,              // v_mov_b32 v1, scc
+        0x7E04_02FF, 0x0000_0000, // v_mov_b32 v2, 0 (the store's address)
+        0x7E06_02FF, 0x0000_0777, // v_mov_b32 v3, 0x777 (the store's data)
+    ];
+    w.extend(global_store(3, 2, 0, 0x40)); // global_store_dword v3, v2, s[0:1], 0x40 (aliases the load)
+    divergent_read(&mut w, 0x7E0C_0501, 0xBF07_8006); // v_readfirstlane_b32 s6, v1; s_cmp_lg_u32 s6, 0
+    assert!(
+        refused_in_halves(&w),
+        "a v_mov_b32 of an s_load-derived SCC keeps the first-lane refusal"
+    );
+}
+
+/// A `v_cmp_*` of an unproven scalar (an `s_load_dword` result that can alias
+/// a store) writes a VCC whose per-lane bit can differ between the two host
+/// halves; a `v_cndmask_b32` selecting on that VCC is then not alike, and a
+/// `v_readfirstlane_b32` of its result in a divergent block keeps its
+/// first-lane refusal.
+#[test]
+fn a_cndmask_on_a_vcc_from_an_aliasing_s_load_keeps_the_first_lane_refusal() {
+    let mut w = vec![
+        0xF400_0080, 0xFA00_0040, // s_load_dword s2, s[0:1], 0x40 (can alias the store)
+        0xBF8C_0000,              // s_waitcnt lgkmcnt(0)
+        0x7E04_02FF, 0x0000_0000, // v_mov_b32 v2, 0 (the store's address)
+        0x7E0A_02FF, 0x0000_0040, // v_mov_b32 v5, 0x40
+        0x7E0C_02FF, 0x0000_0000, // v_mov_b32 v6, 0
+        0x7D84_0C02,              // v_cmp_eq_u32 vcc, s2, v6 (the unproven scalar)
+        0xD501_0003, 128 | 192 << 9 | 106 << 18, // v_cndmask_b32 v3, 0, 0x40, vcc
+    ];
+    w.extend(global_store(2, 2, 0, 0x40)); // global_store_dword v2, v2, s[0:1], 0x40 (aliases the load)
+    divergent_read(&mut w, 0x7E0E_0503, 0xBF07_8007); // v_readfirstlane_b32 s7, v3; s_cmp_lg_u32 s7, 0
+    assert!(
+        refused_in_halves(&w),
+        "a v_cndmask_b32 on a vcc from an s_load compare keeps the first-lane refusal"
+    );
+}
+
+/// A guarded `v_mov_b32 v5, 1` over an old `0`, under a guard a
+/// `buffer_load_dword` comparison controls, with a `global_store_dword`
+/// present: the load is not lane-uniform with a store present, so the guard
+/// is not alike and one host half can run the write while the other keeps
+/// the `0`. The guarded write must not enter `same`, and a
+/// `v_readfirstlane_b32` of `v5` in a divergent block keeps its refusal.
+#[test]
+fn a_guarded_v_mov_under_a_buffer_load_guard_with_a_store_keeps_the_first_lane_refusal() {
+    // s[0:3]: root constants (s[2:3] the store's address); s[4:5]: the root
+    // table the buffer's descriptor is loaded from into s[8:11].
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let mut w = vec![
+        0x7E02_02FF,
+        0x0000_0000, // v_mov_b32 v1, 0 (the buffer load's address)
+        0x7E0A_02FF,
+        0x0000_0000, // v_mov_b32 v5, 0 (the old value of the guarded write)
+        0x7E0C_02FF,
+        0x0000_0777, // v_mov_b32 v6, 0x777 (the store's data)
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+        0xE030_1000,
+        0x8002_0201, // buffer_load_dword v2, v1, s[8:11], 0 offen
+        0x7D84_0480, // v_cmp_eq_u32 vcc, 0, v2 (not lane-uniform with a store present)
+        0xBE90_246A, // s_and_saveexec_b64 s[16:17], vcc
+    ];
+    w.extend(global_store(6, 1, 2, 0)); // global_store_dword v6, v1, s[2:3], 0
+    w.extend([0x7E0A_02FF, 0x0000_0001]); // v_mov_b32 v5, 1 (under the guard)
+    w.push(0xBEFE_0410); // s_mov_b64 exec, s[16:17]
+    divergent_read(&mut w, 0x7E12_0505, 0xBF07_8009); // v_readfirstlane_b32 s9, v5; s_cmp_lg_u32 s9, 0
+    let first_across = super::halves::FIRST_ACROSS;
+    assert!(
+        matches!(lower_halves_with(&w, vec![constants, root(RootType::Table, 4, 1)], vec![buffer]), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across),
+        "a guarded v_mov under a buffer-load guard with a store present keeps the refusal"
+    );
+}
+
+/// `vccz` (inline constant 251) is a one-bit zero test (`0` or `1`), not an
+/// all-zeros 64-bit lane mask: as a `v_cndmask_b32` select mask, `1` picks
+/// the source only for lane 0. A first-lane read of the cndmask's result in
+/// a divergent block keeps its refusal; an all-zeros literal mask still
+/// selects the same source in every lane and needs no exchange.
+#[test]
+fn a_cndmask_with_vccz_as_its_mask_keeps_the_first_lane_refusal() {
+    // v_cndmask_b32 v3, 0, 0x40, <mask> (VOP3 opcode 0x101: the third source
+    // is the 64-bit mask).
+    let cndmask = |mask: u32| [0xD501_0003, 128 | 192 << 9 | mask << 18];
+    let head = [
+        0x7E0A_02FF,
+        0x0000_0040, // v_mov_b32 v5, 0x40
+        0x7E0C_02FF,
+        0x0000_0000, // v_mov_b32 v6, 0
+        0x7D84_0C80, // v_cmp_eq_u32 vcc, 0, v6 (alike operands, so vcc is in `same`)
+    ];
+    // vccz as the select mask.
+    let mut w = Vec::new();
+    w.extend(head);
+    w.extend(cndmask(251)); // v_cndmask_b32 v3, 0, 0x40, vccz
+    divergent_read(&mut w, 0x7E0E_0503, 0xBF07_8007); // v_readfirstlane_b32 s7, v3; s_cmp_lg_u32 s7, 0
+    assert!(
+        refused_in_halves(&w),
+        "vccz as a select mask (1 selects only lane 0) keeps the first-lane refusal"
+    );
+    // An all-zeros literal mask selects the same source in every lane.
+    let mut w = Vec::new();
+    w.extend(head);
+    w.extend(cndmask(128)); // v_cndmask_b32 v3, 0, 0x40, 0
+    divergent_read(&mut w, 0x7E0E_0503, 0xBF07_8007);
+    let l = lower_halves(&w).expect("an all-zeros select mask stays lane-uniform");
+    assert_eq!(l.wave_size, Some(32), "the console wave ran as two halves");
+    assert_eq!(
+        l.shape.barriers, 0,
+        "no cross-half exchange was emitted for the all-zeros mask"
+    );
+}
+
+
