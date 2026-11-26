@@ -686,6 +686,7 @@ impl<'a> Lower<'a> {
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         if let Some(keep) = keep {
+            s.repack_signatures = true;
             if x.native.stage == HwStage::Ps {
                 prune_signature(&mut s.inputs, keep);
             } else if x.native.stage == HwStage::Ms {
@@ -785,7 +786,13 @@ impl<'a> Lower<'a> {
             let mut max_primitives = ms.max_primitives;
             let declared =
                 super::MeshOutputs::of(&s.outputs, &s.prims, max_vertices, max_primitives);
-            if declared.bytes() > super::METAL_MESH_OUTPUT_BYTES {
+            let aligned = super::mesh_elements_aligned_bytes(
+                &s.outputs,
+                &s.prims,
+                max_vertices,
+                max_primitives,
+            );
+            if declared.bytes().max(aligned) > super::METAL_MESH_OUTPUT_BYTES {
                 max_vertices = max_vertices.min(ms.threads);
                 max_primitives = max_primitives.min(ms.threads);
             }

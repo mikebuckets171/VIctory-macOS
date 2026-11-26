@@ -216,10 +216,9 @@ impl Shader {
                     let keep = link_mesh_outputs() && done.0.as_ref().is_ok_and(|t| {
                         self.stage == "pixel"
                             || (self.stage == "mesh"
-                                && victory_shader::emit::mesh_outputs(&t.host.dxil)
-                                    .is_some_and(|o| {
-                                        o.bytes() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
-                                    }))
+                                && mesh_output_bytes(&t.host.dxil).is_some_and(|bytes| {
+                                    bytes > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
+                                }))
                     });
                     if !keep {
                         *container = Vec::new();
@@ -241,22 +240,24 @@ impl Shader {
                             kernel_ms,
                             "shader translated"
                         );
-                        // D3DMetal makes such a pipeline and marks it a no-op:
-                        // its draws are dropped without an error (#132).
+                        // D3DMetal makes such a pipeline and marks it a no-op
+                        // or hangs the queue (#132, #172).
                         use victory_shader::emit::{METAL_MESH_OUTPUT_BYTES, mesh_outputs};
-                        if let Some(o) = mesh_outputs(&t.host.dxil)
-                            .filter(|o| o.bytes() > METAL_MESH_OUTPUT_BYTES)
-                            .filter(|_| crate::shader_cache::under_wine())
+                        if let (Some(o), Some(bytes)) =
+                            (mesh_outputs(&t.host.dxil), mesh_output_bytes(&t.host.dxil))
+                            && bytes > METAL_MESH_OUTPUT_BYTES
+                            && crate::shader_cache::under_wine()
                         {
                             tracing::warn!(
                                 hash = %self.hash,
-                                bytes = o.bytes(),
+                                bytes,
+                                packed_bytes = o.bytes(),
                                 limit = METAL_MESH_OUTPUT_BYTES,
                                 vertices = o.vertices,
                                 primitives = o.primitives,
                                 vertex_components = o.vertex_components,
                                 primitive_components = o.primitive_components,
-                                "mesh shader outputs exceed Metal's limit; its draws are likely dropped"
+                                "mesh shader outputs exceed Metal's limit; linking or refusing on host"
                             );
                         }
                     }
@@ -355,6 +356,13 @@ pub(crate) fn refuse_over_limit_mesh() -> bool {
     })
 }
 
+/// The larger of the packed and Metal-aligned mesh output counts for `dxil`.
+#[cfg(windows)]
+pub(crate) fn mesh_output_bytes(dxil: &[u8]) -> Option<u32> {
+    let packed = victory_shader::emit::mesh_outputs(dxil)?.bytes();
+    Some(victory_shader::emit::mesh_aligned_bytes(dxil).map_or(packed, |a| packed.max(a)))
+}
+
 #[cfg(windows)]
 struct LinkedPair {
     mesh: Arc<Shader>,
@@ -401,17 +409,17 @@ pub(crate) fn translate_linked(
             .as_ref()
             .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
     }
-    let mesh_bytes = ms
-        .container
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let pixel_bytes = ps.map(|p| {
-        p.container
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    });
+    let load_bytes = |s: &Shader| {
+        let b = s.container.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if b.is_empty()
+            && let (Some(full), Some(dir)) = (s.spilled.get(), SPILL_DIR.get())
+        {
+            return crate::read_file(&spill_path(dir, full)).unwrap_or_default();
+        }
+        b
+    };
+    let mesh_bytes = load_bytes(ms);
+    let pixel_bytes = ps.map(load_bytes);
     let options = crate::shader_cache::runtime_options();
     let result = match victory_shader::emit::translate_linked(
         &mesh_bytes,
@@ -419,7 +427,7 @@ pub(crate) fn translate_linked(
         options,
     ) {
         Ok((ms_host, ps_host)) => {
-            let ms_bytes = victory_shader::emit::mesh_outputs(&ms_host.dxil).map(|o| o.bytes());
+            let ms_bytes = mesh_output_bytes(&ms_host.dxil);
             let ms_used = ms.translated()?.used.clone();
             let mesh = ms.with_translation(Translated {
                 host: ms_host,
