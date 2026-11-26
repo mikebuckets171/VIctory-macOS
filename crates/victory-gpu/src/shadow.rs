@@ -1322,6 +1322,18 @@ pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
+/// Batched [`forget_read`] under one hold of the read-marks lock.
+pub(crate) fn forget_reads(slots: &[u32]) {
+    if slots.is_empty() {
+        return;
+    }
+    READS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .1
+        .extend_from_slice(slots);
+}
+
 /// After a submission: every page its shaders marked as written through
 /// views goes back ([`Shadow::copy_back_marked`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title

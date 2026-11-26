@@ -4829,6 +4829,17 @@ pub(crate) fn retire(resource: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
 }
 
+/// Batched [`retire`] under one hold of the retired-resources lock.
+pub(crate) fn retire_all(mut resources: Vec<ID3D12Resource>) {
+    if resources.is_empty() {
+        return;
+    }
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .append(&mut resources);
+}
+
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
