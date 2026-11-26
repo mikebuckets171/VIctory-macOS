@@ -188,6 +188,12 @@ pub extern "system" fn XMemVirtualAlloc(
     {
         victory_gpu::alias_region(at as usize, size, false);
     }
+    // A placeholder reservation that views of physical pages will fill: the
+    // GPU side may see it through reserved buffers (`victory_gpu::view_space_map`).
+    #[cfg(feature = "diagnostics")]
+    if !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER != 0 {
+        victory_gpu::view_space_reserve(at as usize, size);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -1423,6 +1429,13 @@ fn finish_map(
     // before acquiring `GUARDS`) so concurrent DirectStorage completions never
     // miss a newly mapped view.
     let aliased = shown_mut().note(base, len, &slice);
+    // The view shows the heap's pages: the GPU's tiles of the placeholder
+    // space follow, so it reads and writes them there with no host copy
+    // (`victory_gpu::view_space_map`).
+    #[cfg(feature = "diagnostics")]
+    if let Some(shared) = &slice.section.shared {
+        victory_gpu::view_space_map(base, len, shared, slice.index * PAGE);
+    }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     for (at, others) in aliased {
@@ -1570,6 +1583,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         };
         shown_mut().forget(at, size, &slice);
         let going = victory_gpu::title_memory_unmapping(at, size);
+        // The GPU's tiles there point at nothing from the next submission.
+        #[cfg(feature = "diagnostics")]
+        if slice.section.shared.is_some() {
+            victory_gpu::view_space_unmap(at, size);
+        }
         // SAFETY: a view we mapped; it becomes a placeholder again.
         let gone = unsafe {
             UnmapViewOfFile2(

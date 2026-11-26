@@ -442,7 +442,323 @@ impl PhysicalHeap {
         };
         remap.msg == 0 && remap.kr == 0 && remap.address == at as u64
     }
+
+    /// The heap whose tiles reserved buffers take (`view_space_map`).
+    pub(crate) fn heap(&self) -> &ID3D12Heap {
+        &self._heap
+    }
 }
+
+/// The title's placeholder address space (64 KiB page reservations that
+/// `XMemMapPhysicalPages` fills with views) as the GPU sees it: reserved
+/// buffers over it, a [`CHUNK`] each, whose tiles point at the physical
+/// heaps' pages wherever a view shows them (`view_space_map`). Each chunk
+/// is one zero-copy region for the GPU side, so a title buffer or a loose
+/// window anywhere in it is a slice of the chunk's buffer, however many
+/// views of scattered pages it spans: no host copy, no guards. A page
+/// shown at two addresses is one memory through two tiles. Unmapped
+/// pages read zeros. Ranges across two chunks keep host copies.
+#[cfg(any(test, feature = "diagnostics"))]
+mod view_space {
+    use super::*;
+    use std::collections::BTreeMap;
+    use windows::core::Interface;
+
+    /// A chunk's span: under the 2^27 four-byte elements a raw view of a
+    /// buffer may have (512 MiB), which shaders reading title memory by
+    /// address are given (`crate::memory`).
+    pub(crate) const CHUNK: usize = 256 << 20;
+
+    pub(crate) struct Chunk {
+        pub(crate) reserved: ID3D12Resource,
+        /// The heaps its tiles were ever pointed at, kept alive with it.
+        heaps: Vec<ID3D12Heap>,
+    }
+
+    /// A tile mapping to make before the next submission: `count` tiles of
+    /// a chunk's buffer from tile `first`, to the heap's tiles from
+    /// `heap_tile` (`None`: to nothing).
+    struct Pending {
+        chunk: usize,
+        first: u32,
+        count: u32,
+        heap: Option<(ID3D12Heap, u32)>,
+    }
+
+    #[derive(Default)]
+    pub(crate) struct Spaces {
+        /// Placeholder reservations by base: their length.
+        pub(crate) reservations: BTreeMap<usize, usize>,
+        /// Chunks by their first title address.
+        pub(crate) chunks: BTreeMap<usize, Chunk>,
+        pending: Vec<Pending>,
+    }
+
+    pub(crate) static SPACES: Mutex<Option<Spaces>> = Mutex::new(None);
+
+    pub(crate) fn spaces() -> std::sync::MutexGuard<'static, Option<Spaces>> {
+        SPACES.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Chunks made, and tile updates applied, for the logs.
+    pub(crate) static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static UPDATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// The chunk holding `at` in the reservation `[base, base + len)`:
+    /// its first address and length.
+    fn chunk_of(base: usize, len: usize, at: usize) -> (usize, usize) {
+        let first = base + (at - base) / CHUNK * CHUNK;
+        (first, CHUNK.min(base + len - first))
+    }
+
+    impl Spaces {
+        /// The reservation holding `[at, at + len)`, if one does.
+        fn reservation(&self, at: usize, len: usize) -> Option<(usize, usize)> {
+            self.reservations
+                .range(..=at)
+                .next_back()
+                .filter(|&(&b, &l)| at + len <= b + l)
+                .map(|(&b, &l)| (b, l))
+        }
+
+        /// The chunk at `first` of `len` bytes, made (and registered as a
+        /// zero-copy region) the first time; `None` if the host would not
+        /// make it or its range meets another aliased region.
+        fn chunk(&mut self, first: usize, len: usize) -> Option<&mut Chunk> {
+            if let std::collections::btree_map::Entry::Vacant(slot) = self.chunks.entry(first) {
+                let end = (first + len) as u64;
+                if crate::shadow::has_aliased_overlap(first as u64, end) {
+                    tracing::warn!(
+                        at = format_args!("{first:#x}"),
+                        len,
+                        "placeholder space over an aliased region: left to host copies"
+                    );
+                    return None;
+                }
+                let h = host()?;
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: len as u64,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                };
+                let mut reserved: Option<ID3D12Resource> = None;
+                // SAFETY: plain creation with an output slot on this stack.
+                if let Err(error) = unsafe {
+                    h.device.CreateReservedResource(
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut reserved,
+                    )
+                } {
+                    tracing::warn!(at = format_args!("{first:#x}"), len, %error, "no reserved buffer for placeholder space: left to host copies");
+                    return None;
+                }
+                let reserved = reserved?;
+                crate::host::name(&reserved, || {
+                    format!("title placeholder space {first:#x}+{len:#x}")
+                });
+                // SAFETY: a live buffer.
+                let gpu = unsafe { reserved.GetGPUVirtualAddress() };
+                let shadow = crate::shadow::Shadow::new_aliased_at(
+                    reserved.clone(),
+                    first as *mut u8,
+                    gpu,
+                    first as u64,
+                    len as u64,
+                    0,
+                );
+                crate::shadow::register_aliased(shadow);
+                MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    at = format_args!("{first:#x}"),
+                    len,
+                    "placeholder space seen by the GPU through a reserved buffer"
+                );
+                slot.insert(Chunk {
+                    reserved,
+                    heaps: Vec::new(),
+                });
+            }
+            self.chunks.get_mut(&first)
+        }
+
+        /// The tile updates for title `[at, at + len)`, cut at chunks: to
+        /// the heap's pages from byte `heap_offset` on, or to nothing.
+        /// False where a chunk could not be had (copies serve it then).
+        fn queue(&mut self, at: usize, len: usize, heap: Option<(&ID3D12Heap, usize)>) -> bool {
+            let Some((base, res_len)) = self.reservation(at, len) else {
+                return false;
+            };
+            let mut ok = true;
+            let (mut a, end) = (at, at + len);
+            while a < end {
+                let (first, chunk_len) = chunk_of(base, res_len, a);
+                let b = end.min(first + chunk_len);
+                let tiles = ((b - a) / PAGE) as u32;
+                let first_tile = ((a - first) / PAGE) as u32;
+                let mapped = match heap {
+                    Some((heap, offset)) => {
+                        let Some(chunk) = self.chunk(first, chunk_len) else {
+                            ok = false;
+                            a = b;
+                            continue;
+                        };
+                        if !chunk.heaps.iter().any(|h| h.as_raw() == heap.as_raw()) {
+                            chunk.heaps.push(heap.clone());
+                        }
+                        Some((heap.clone(), ((offset + (a - at)) / PAGE) as u32))
+                    }
+                    // Nothing to unmap in a chunk never made.
+                    None if !self.chunks.contains_key(&first) => {
+                        a = b;
+                        continue;
+                    }
+                    None => None,
+                };
+                self.pending.push(Pending {
+                    chunk: first,
+                    first: first_tile,
+                    count: tiles,
+                    heap: mapped,
+                });
+                a = b;
+            }
+            ok
+        }
+    }
+
+    /// Records `[base, base + len)` as a placeholder reservation views of
+    /// physical pages will fill.
+    pub fn view_space_reserve(base: usize, len: usize) {
+        if base == 0 || len == 0 || !(base | len).is_multiple_of(PAGE) {
+            return;
+        }
+        spaces()
+            .get_or_insert_default()
+            .reservations
+            .insert(base, len);
+        if len >= 64 << 20 {
+            tracing::info!(
+                base = format_args!("{base:#x}"),
+                len,
+                "placeholder reservation for physical page views"
+            );
+        }
+    }
+
+    /// The view at `[at, at + len)` shows the heap's bytes from
+    /// `heap_offset` (`PhysicalHeap::alias_view` did it for the CPU): the
+    /// GPU's tiles there follow before the next submission. False if the
+    /// GPU side cannot follow (no reservation, no reserved buffer).
+    pub fn view_space_map(
+        at: usize,
+        len: usize,
+        heap: &super::PhysicalHeap,
+        heap_offset: usize,
+    ) -> bool {
+        if len == 0 || !(at | len | heap_offset).is_multiple_of(PAGE) {
+            return false;
+        }
+        let mut guard = spaces();
+        let Some(spaces) = guard.as_mut() else {
+            return false;
+        };
+        spaces.queue(at, len, Some((heap.heap(), heap_offset)))
+    }
+
+    /// The view at `[at, at + len)` goes: its tiles point at nothing from
+    /// the next submission on.
+    pub fn view_space_unmap(at: usize, len: usize) {
+        if len == 0 || !(at | len).is_multiple_of(PAGE) {
+            return;
+        }
+        if let Some(spaces) = spaces().as_mut() {
+            spaces.queue(at, len, None);
+        }
+    }
+
+    /// Makes the pending tile mappings on `queue`, the queue about to run
+    /// the next submission (every earlier one has finished: the host waits
+    /// for each, so no list in flight reads through the old mappings).
+    pub(crate) fn apply_view_space(queue: &ID3D12CommandQueue) {
+        let pending = {
+            let mut guard = spaces();
+            let Some(spaces) = guard.as_mut() else {
+                return;
+            };
+            if spaces.pending.is_empty() {
+                return;
+            }
+            let pending = std::mem::take(&mut spaces.pending);
+            pending
+                .into_iter()
+                .filter_map(|p| spaces.chunks.get(&p.chunk).map(|c| (c.reserved.clone(), p)))
+                .collect::<Vec<_>>()
+        };
+        for (reserved, p) in &pending {
+            let start = D3D12_TILED_RESOURCE_COORDINATE {
+                X: p.first,
+                ..Default::default()
+            };
+            let size = D3D12_TILE_REGION_SIZE {
+                NumTiles: p.count,
+                ..Default::default()
+            };
+            // SAFETY: the region lies in the chunk's buffer (cut to it when
+            // queued) and the heap range in the heap (the view's bytes);
+            // both stay alive (the chunk keeps its heaps).
+            unsafe {
+                match &p.heap {
+                    Some((heap, heap_tile)) => queue.UpdateTileMappings(
+                        reserved,
+                        1,
+                        Some(&start),
+                        Some(&size),
+                        heap,
+                        1,
+                        Some(&D3D12_TILE_RANGE_FLAG_NONE),
+                        Some(heap_tile),
+                        Some(&p.count),
+                        D3D12_TILE_MAPPING_FLAG_NONE,
+                    ),
+                    None => queue.UpdateTileMappings(
+                        reserved,
+                        1,
+                        Some(&start),
+                        Some(&size),
+                        None::<&ID3D12Heap>,
+                        1,
+                        Some(&D3D12_TILE_RANGE_FLAG_NULL),
+                        None,
+                        Some(&p.count),
+                        D3D12_TILE_MAPPING_FLAG_NONE,
+                    ),
+                }
+            }
+        }
+        UPDATES.fetch_add(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Chunks made and tile updates applied so far (diagnostics).
+    pub fn view_space_counts() -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (MADE.load(Relaxed), UPDATES.load(Relaxed))
+    }
+}
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) use view_space::apply_view_space;
+#[cfg(any(test, feature = "diagnostics"))]
+pub use view_space::{view_space_counts, view_space_map, view_space_reserve, view_space_unmap};
 
 #[cfg(any(test, feature = "diagnostics"))]
 impl Drop for PhysicalHeap {
@@ -799,6 +1115,129 @@ mod tests {
         }
         // SAFETY: querying device health.
         assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn placeholder_space_is_one_zero_copy_region_through_reserved_tiles() {
+        if !crate::watch::rosetta() {
+            return;
+        }
+        let Some(h) = host() else {
+            return;
+        };
+        let heap = PhysicalHeap::new(&h.device, 4 * PAGE).expect("a CPU-visible physical heap");
+        // A reservation of 8 pages, as `XMemVirtualAlloc` makes for physical
+        // page views; the test commits the pages it shows (xmem maps views).
+        let n = 8 * PAGE;
+        // SAFETY: fresh reservation for the test, released below.
+        let res =
+            unsafe { VirtualAlloc(std::ptr::null(), n, MEM_RESERVE, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!res.is_null());
+        let commit = |at: *mut u8, len: usize| {
+            // SAFETY: inside our reservation.
+            assert!(!unsafe { VirtualAlloc(at.cast(), len, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        };
+        view_space_reserve(res as usize, n);
+        // View A: heap pages 1 and 2 at reservation pages 1 and 2. View B:
+        // heap page 2 again at reservation page 4 (one page at two places).
+        // SAFETY: inside the reservation.
+        let (a, b) = unsafe { (res.add(PAGE), res.add(4 * PAGE)) };
+        commit(a, 2 * PAGE);
+        commit(b, PAGE);
+        // SAFETY: both views are ours and the heap outlives them here.
+        unsafe {
+            assert!(heap.alias_view(a as usize, PAGE, 2 * PAGE));
+            assert!(heap.alias_view(b as usize, 2 * PAGE, PAGE));
+        }
+        assert!(view_space_map(a as usize, 2 * PAGE, &heap, PAGE));
+        assert!(view_space_map(b as usize, PAGE, &heap, 2 * PAGE));
+        // The mappings land on a queue before any list uses them.
+        run_copy(&h.device, |_| {});
+        let apply = |device: &ID3D12Device| {
+            // SAFETY: a queue of the test's own, waited for.
+            unsafe {
+                let queue: ID3D12CommandQueue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                apply_view_space(&queue);
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                let event = CreateEventW(None, false, false, None).unwrap();
+                queue.Signal(&fence, 1).unwrap();
+                if fence.GetCompletedValue() < 1 {
+                    fence.SetEventOnCompletion(1, event).unwrap();
+                    WaitForSingleObject(event, 5000);
+                }
+                let _ = windows::Win32::Foundation::CloseHandle(event);
+            }
+        };
+        apply(&h.device);
+        // A range across both views (and the hole between them) is one
+        // region: the reservation's chunk, at the address's offset in it.
+        let shadow = crate::shadow::find(a as u64, (4 * PAGE) as u64)
+            .expect("a region for the placeholder space");
+        assert!(shadow.is_aliased());
+        assert_eq!(shadow.offset(a as u64), PAGE as u64);
+        assert_eq!(shadow.offset(b as u64), (4 * PAGE) as u64);
+        for round in 0..3u8 {
+            // The CPU writes through view B: view A shows it, and the GPU
+            // reads it through both tiles of that page.
+            let bytes: Vec<u8> = (0..PAGE)
+                .map(|i| (i as u8).wrapping_mul(13) ^ round)
+                .collect();
+            // SAFETY: inside view B.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), b, PAGE) };
+            // SAFETY: inside view A.
+            let shown = unsafe { std::slice::from_raw_parts(a.add(PAGE), PAGE) };
+            assert_eq!(shown, &bytes[..]);
+            assert_eq!(
+                gpu_read(&h.device, &shadow.buffer, (2 * PAGE) as u64, PAGE),
+                bytes,
+                "tile 2"
+            );
+            assert_eq!(
+                gpu_read(&h.device, &shadow.buffer, (4 * PAGE) as u64, PAGE),
+                bytes,
+                "tile 4"
+            );
+            // The GPU writes through tile 1 (view A's first page): the CPU
+            // sees it there.
+            let new: Vec<u8> = (0..PAGE).map(|i| (i as u8) ^ round ^ 0xa5).collect();
+            gpu_write(&h.device, &shadow.buffer, PAGE as u64, &new);
+            // SAFETY: inside view A.
+            assert_eq!(unsafe { std::slice::from_raw_parts(a, PAGE) }, &new[..]);
+        }
+        // View B goes: its tile reads nothing after the next submission;
+        // view A's stay.
+        view_space_unmap(b as usize, PAGE);
+        apply(&h.device);
+        let gone = gpu_read(&h.device, &shadow.buffer, (4 * PAGE) as u64, PAGE);
+        eprintln!(
+            "unmapped tile reads {} nonzero bytes of {PAGE}",
+            gone.iter().filter(|&&x| x != 0).count()
+        );
+        // SAFETY: inside view A.
+        let still = unsafe { std::slice::from_raw_parts(a.add(PAGE), PAGE) }.to_vec();
+        assert_eq!(
+            gpu_read(&h.device, &shadow.buffer, (2 * PAGE) as u64, PAGE),
+            still
+        );
+        let (made, updates) = view_space_counts();
+        eprintln!("view space: {made} chunks made, {updates} tile updates");
+        // Leave nothing for later tests: the region and the reservation go.
+        view_space_unmap(a as usize, 2 * PAGE);
+        apply(&h.device);
+        assert!(crate::shadow::unregister_aliased(res as u64));
+        if let Some(s) = view_space::spaces().as_mut() {
+            s.reservations.remove(&(res as usize));
+            s.chunks.remove(&(res as usize));
+        }
+        // SAFETY: a plain query of device health.
+        assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
+        // SAFETY: our reservation, no longer used.
+        unsafe { VirtualFree(res.cast(), 0, MEM_RELEASE) };
     }
 
     #[test]

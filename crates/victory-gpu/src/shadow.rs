@@ -636,6 +636,20 @@ impl Shadow {
         start: u64,
         len: u64,
     ) -> Arc<Shadow> {
+        Shadow::new_aliased_at(buffer, data, gpu, start, len, 0)
+    }
+
+    /// [`Shadow::new_aliased`] over bytes `[base, base + len)` of `buffer`
+    /// (a pool of the title's physical pages, `crate::alias::map_pool`):
+    /// `data` and `gpu` are those bytes' own addresses.
+    pub(crate) fn new_aliased_at(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        base: u64,
+    ) -> Arc<Shadow> {
         let marks = marks().take(pages(start, len));
         let shadow = Arc::new(Shadow {
             buffer,
@@ -650,7 +664,7 @@ impl Shadow {
             widened: Mutex::default(),
             widened_source: Mutex::default(),
             has_widened: AtomicBool::new(false),
-            base: 0,
+            base,
             slice: None,
             aliased: true,
             sums: Mutex::default(),
@@ -2011,13 +2025,9 @@ pub(crate) fn has_aliased_overlap(start: u64, end: u64) -> bool {
         return false;
     }
     let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
-    let span = ALIASED_SPAN.load(Ordering::Relaxed);
-    let lowest = start.saturating_sub(span);
-    if map
-        .range(lowest..=start)
-        .rev()
-        .any(|(&s, sh)| s + sh.len > start)
-    {
+    // Regions do not overlap one another: the one below `start` that could
+    // reach into the range is the last one starting at or below it.
+    if map.range(..=start).next_back().is_some_and(|(&s, sh)| s + sh.len > start) {
         return true;
     }
     map.range(start..end).next().is_some()
@@ -2042,22 +2052,18 @@ pub(crate) fn unregister_aliased(start: u64) -> bool {
     removed
 }
 
+/// The aliased region holding `[address, end)`, if one does. Regions never
+/// overlap ([`has_aliased_overlap`] keeps them apart), so only the last one
+/// starting at or below `address` can: one lookup, however many regions
+/// (a pool's views of single pages count in the thousands).
 fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if ALIASED_COUNT.load(Ordering::Acquire) == 0 {
         return None;
     }
     let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
-    if map.is_empty() {
-        return None;
-    }
-    let span = ALIASED_SPAN.load(Ordering::Relaxed);
-    let lowest = end.saturating_sub(span);
-    if lowest > address {
-        return None;
-    }
-    map.range(lowest..=address)
-        .rev()
-        .find(|(_, s)| s.start + s.len >= end)
+    map.range(..=address)
+        .next_back()
+        .filter(|(_, s)| s.start + s.len >= end)
         .map(|(_, s)| s.clone())
 }
 

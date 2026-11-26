@@ -2247,6 +2247,11 @@ impl Host {
                 group.push(mark.list());
             }
             let queue = self.queue();
+            // Tile mappings of the title's placeholder space that changed
+            // since the last submission (`crate::alias::view_space_map`):
+            // on this queue, before the lists that may read through them.
+            #[cfg(feature = "diagnostics")]
+            crate::alias::apply_view_space(&queue);
             // SAFETY: closed lists; the fence and event are ours.
             let waited = unsafe {
                 // All native calls share the existing fence signal and wait.
