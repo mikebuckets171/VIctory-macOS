@@ -247,7 +247,7 @@ mod crosslane_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -461,6 +461,8 @@ pub struct Options {
     /// than 32 lanes gets group barriers where its lanes read LDS other
     /// lanes may have written, which the console's lockstep made safe.
     pub narrow_waves: bool,
+    /// Keep the per-lane translation for wave64 programs on 32-lane hosts.
+    pub disable_literal_halves: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -954,14 +956,14 @@ fn emit_pruned(
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
     };
-    let l = match lower::lower_pruned(&parts(st, res), keep) {
+    let l = match lower::lower_pruned(&parts(st, res), keep, !options.disable_literal_halves) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower_pruned(&parts(&st, &res), keep)?
+            lower::lower_pruned(&parts(&st, &res), keep, false)?
         }
         l => l?,
     };

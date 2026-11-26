@@ -9,8 +9,11 @@
 //! where the adapter has 64-lane waves (AMD), which is the console's own
 //! form; the results must be the console's, computed here, in both.
 
+#[cfg(windows)]
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{lower, validator};
+use super::lower;
+#[cfg(windows)]
+use super::validator;
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -74,6 +77,7 @@ fn in_halves() -> Vec<u32> {
 }
 
 /// What the console gives [`in_halves`]'s lane `l`.
+#[cfg(windows)]
 fn console(l: u32) -> [u32; 8] {
     [
         l,
@@ -138,30 +142,44 @@ fn lowered_with(
     host_wave32: bool,
     narrow_waves: bool,
 ) -> Result<lower::Lowered, crate::ShaderError> {
+    lower_halves(native, host_wave32, narrow_waves, false)
+}
+
+fn lower_halves(
+    native: &NativeProgram,
+    host_wave32: bool,
+    narrow_waves: bool,
+    literal: bool,
+) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
-    lower::lower(&lower::Parts {
-        native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        view_marks: false,
-        atomic_locks: false,
-        atomic_lock_rounds: false,
-        atomic_umax: false,
-        bias_as_gradients: false,
-        narrow_waves,
-        host_wave32,
-    })
+    lower::lower_pruned(
+        &lower::Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: false,
+            atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
+            bias_as_gradients: false,
+            narrow_waves,
+            host_wave32,
+        },
+        None,
+        literal,
+    )
 }
 
+#[cfg(windows)]
 fn shader(l: lower::Lowered) -> super::HostShader {
     super::HostShader {
         stage: HwStage::Cs,
@@ -363,6 +381,7 @@ fn a_wave64_program_reading_lanes_declares_32_lane_waves_in_halves() {
     let whole = lowered(&n, false).expect("one wave64");
     assert_eq!(halves.wave_size, Some(32));
     assert_eq!(whole.wave_size, Some(64));
+    #[cfg(windows)]
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut halves.dxil.clone())
             .expect("DXIL validation failed");
@@ -416,6 +435,7 @@ fn lanes_below(limit: u32) -> Vec<u32> {
 
 /// What the console gives [`lanes_below`]`(limit)`'s lane `l` in a group of
 /// `threads`.
+#[cfg(windows)]
 fn console_lanes_below(limit: u32, threads: u32, l: u32) -> [u32; 3] {
     let wave = l & !63;
     let below = |end: u32| limit.min(threads).min(end).saturating_sub(wave);
@@ -557,6 +577,7 @@ fn reduction(op: u32, ident: u32, input: u32) -> Vec<u32> {
 
 /// What the console gives [`reduction`] of `f` (folding the inputs of a
 /// console wave's lanes) in lane `l` of a group of `threads`.
+#[cfg(windows)]
 fn console_reduction(
     threads: u32,
     l: u32,
@@ -658,6 +679,7 @@ fn lane_masks_read_as_data_pass_between_halves() {
 
     let halves = lowered(&native(&lanes_below(40), true, 64, 0), true).expect("halves");
     assert_eq!(halves.wave_size, Some(32));
+    #[cfg(windows)]
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut halves.dxil.clone())
             .expect("DXIL validation failed");
@@ -669,6 +691,7 @@ fn lane_masks_read_as_data_pass_between_halves() {
 /// two (one mask each), and in a group of 96, whose second console wave has
 /// no upper half (a high dword of 0).
 #[test]
+#[cfg(windows)]
 fn lane_masks_passed_between_halves_match_the_console_on_every_gpu() {
     let mut failed = differences(&first_active_lane(), 64, 1, &[0; 64]);
     for (limit, threads) in [(40, 64), (100, 128), (80, 96), (96, 96)] {
@@ -713,6 +736,7 @@ fn reductions_and_prefixes_pass_between_halves() {
     for words in [sum, exclusive_prefix()] {
         let halves = lowered(&native(&words, true, 96, 0), true).expect("halves");
         assert_eq!(halves.wave_size, Some(32));
+        #[cfg(windows)]
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
         {
@@ -727,6 +751,7 @@ fn reductions_and_prefixes_pass_between_halves() {
 /// console wave in two halves), of 128 (two), and of 96, whose second
 /// console wave has no upper half.
 #[test]
+#[cfg(windows)]
 fn reductions_and_prefixes_across_halves_match_the_console_on_every_gpu() {
     let mut failed = Vec::new();
     for threads in [32, 64, 96, 128] {
@@ -851,6 +876,7 @@ fn lane_reads_pass_between_halves() {
     for words in [lane_reads(20, 5), first_lane_of_the_thread_id()] {
         let halves = lowered(&native(&words, true, 96, 0), true).expect("halves");
         assert_eq!(halves.wave_size, Some(32));
+        #[cfg(windows)]
         if let Ok(mut v) =
             validator::Validator::load(validator::Validator::default_path().as_deref())
         {
@@ -864,6 +890,7 @@ fn lane_reads_pass_between_halves() {
 /// adapter give the console's lanes: in a group of one console wave, of
 /// two, of 96 (the second console wave has no upper half), and of 32.
 #[test]
+#[cfg(windows)]
 fn lane_reads_across_halves_match_the_console_on_every_gpu() {
     let mut failed = Vec::new();
     for (k, s, threads) in [
@@ -936,12 +963,14 @@ fn lds_of_a_one_wave64_group_is_refused_in_halves() {
 /// `per_lane` dwords at `l * 32`, on every hardware adapter: in halves, and
 /// as one wave64 where the adapter runs 64-lane waves. A line per lane whose
 /// dwords differ from `want` (the console's, `per_lane` per lane).
+#[cfg(windows)]
 fn differences(words: &[u32], threads: u32, per_lane: usize, want: &[u32]) -> Vec<String> {
     differences_with(words, threads, per_lane, want, 0, false)
 }
 
 /// [`differences`] for a program with `lds_bytes` of LDS, lowered with
 /// `narrow_waves` ([`lowered_with`]).
+#[cfg(windows)]
 fn differences_with(
     words: &[u32],
     threads: u32,
@@ -958,11 +987,14 @@ fn differences_with(
         want,
         lds_bytes,
         narrow_waves,
+        false,
     )
 }
 
 /// [`differences_with`] for a program of console waves of 64 lanes
 /// (`wave64`) or of 32, which a host of any wave size runs as it is.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn differences_in(
     wave64: bool,
     words: &[u32],
@@ -971,13 +1003,19 @@ fn differences_in(
     want: &[u32],
     lds_bytes: u32,
     narrow_waves: bool,
+    literal: bool,
 ) -> Vec<String> {
     let n = native(words, wave64, threads, lds_bytes);
-    let forms = if wave64 {
+    let forms = if literal {
+        vec![(
+            "literal halves",
+            shader(lower_halves(&n, true, narrow_waves, true).expect("literal halves")),
+        )]
+    } else if wave64 {
         vec![
             (
                 "halves",
-                shader(lowered_with(&n, true, narrow_waves).expect("halves")),
+                shader(lower_halves(&n, true, narrow_waves, literal).expect("halves")),
             ),
             (
                 "wave64",
@@ -1071,6 +1109,7 @@ fn dpp_row_mask() -> Vec<u32> {
 }
 
 #[test]
+#[cfg(windows)]
 fn dpp_row_masks_name_the_console_rows_on_every_gpu() {
     let want: Vec<u32> = (0..64)
         .map(|l| if l >= 32 { l ^ 1 } else { u32::MAX })
@@ -1145,6 +1184,7 @@ fn first_lane_alike() -> Vec<u32> {
 /// the whole console wave), and one value per console wave in a group of
 /// 128, where each half reads its console wave's.
 #[test]
+#[cfg(windows)]
 fn first_lanes_kept_in_halves_match_the_console_on_every_gpu() {
     let mut failed = differences(&first_lane_of_the_thread_id(), 32, 1, &[0; 32]);
     let want: Vec<u32> = (0..128).flat_map(|l| [l >> 6, l & 63]).collect();
@@ -1155,6 +1195,7 @@ fn first_lanes_kept_in_halves_match_the_console_on_every_gpu() {
 /// [`in_halves`] on every hardware adapter: in halves, and as one wave64
 /// where the adapter runs 64-lane waves; both give the console's results.
 #[test]
+#[cfg(windows)]
 fn wave64_programs_in_halves_match_the_console_on_every_gpu() {
     let want: Vec<u32> = (0..64).flat_map(console).collect();
     let failed = differences(&in_halves(), 64, 8, &want);
@@ -1238,6 +1279,7 @@ fn lds_of_a_one_wave64_group_synced_by_barriers_runs_in_halves() {
 /// the count the lane in the other half wrote (32 for the low half, the
 /// lane less 32 for the high one).
 #[test]
+#[cfg(windows)]
 fn lds_synced_in_halves_matches_the_console_on_every_gpu() {
     let want: Vec<u32> = (0..64u32).map(|l| (l ^ 32).min(32)).collect();
     let failed = differences_with(&lds_across_halves(), 64, 1, &want, 256, true);
@@ -1285,6 +1327,7 @@ fn lds_in_a_loop() -> Vec<u32> {
 
 /// What the console gives [`lds_in_a_loop`]: each pass, a lane's sum and
 /// that of the lane 32 away both become their total.
+#[cfg(windows)]
 fn console_lds_in_a_loop() -> Vec<u32> {
     let mut sum: Vec<u32> = (0..64).collect();
     for _ in 0..4 {
@@ -1330,6 +1373,7 @@ fn lds_of_a_one_wave64_group_in_a_loop_runs_in_halves() {
     let synced = lowered_with(&n, true, true).expect("synced, in halves");
     assert_eq!(synced.wave_size, Some(32));
     assert_eq!(synced.split_barriers, 2);
+    #[cfg(windows)]
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut synced.dxil.clone())
             .expect("DXIL validation failed");
@@ -1347,6 +1391,7 @@ fn lds_of_a_one_wave64_group_in_a_loop_runs_in_halves() {
 /// The loop on every hardware adapter, in halves: every pass gives the
 /// console's sums.
 #[test]
+#[cfg(windows)]
 fn lds_in_a_loop_in_halves_matches_the_console_on_every_gpu() {
     let failed = differences_with(&lds_in_a_loop(), 64, 1, &console_lds_in_a_loop(), 256, true);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
@@ -1374,6 +1419,7 @@ const PERM_OLD: u32 = 0xAAAA;
 /// for FI clear and BOUND_CTRL clear, FI clear and BOUND_CTRL set, FI set
 /// and BOUND_CTRL clear, and FI and BOUND_CTRL both set, each over a `v1`
 /// holding [`PERM_OLD`]. EXEC is whole again for every store.
+#[cfg(windows)]
 fn permlanex16_program(lanes: u32) -> Vec<u32> {
     let wave64 = lanes == 64;
     let full = |w: &mut Vec<u32>| {
@@ -1473,6 +1519,7 @@ fn the_permlanex16_program_is_what_its_comments_say() {
 /// zero or its register as FI and BOUND_CTRL say, on every hardware
 /// adapter, in console waves of 32 and of 64 (in halves and whole).
 #[test]
+#[cfg(windows)]
 fn permlanex16_picks_lanes_as_the_console_does_on_every_gpu() {
     let mut failed = Vec::new();
     for lanes in [32, 64] {
@@ -1484,6 +1531,7 @@ fn permlanex16_picks_lanes_as_the_console_does_on_every_gpu() {
             5,
             &want,
             0,
+            false,
             false,
         ));
     }
@@ -1502,4 +1550,368 @@ fn the_permlanex16_model_follows_the_instruction() {
     assert_eq!(permlanex16_console(16)[0], 15);
     assert_eq!(permlanex16_console(32)[0], 63);
     assert_eq!(permlanex16_console(48)[0], 47);
+}
+
+/// A single result in v3, stored after the body restores EXEC.
+fn literal_program(body: &[u32]) -> Vec<u32> {
+    [
+        PROLOGUE.as_slice(),
+        &[0x3420_0085, 0x7E06_0280], // v16 = v0 * 32; v3 = 0
+        body,
+        &store(3, 0),
+        &[S_ENDPGM],
+    ]
+    .concat()
+}
+
+/// A nonempty mixed EXEC takes the direct edge to the join. Inactive
+/// lanes remain inactive there. The first popcount forces a numeric mask
+/// in the narrowed block, and the joined popcount supplies the result.
+fn literal_mask_join(high_only: bool) -> Vec<u32> {
+    literal_program(&[
+        0x7D86_00A8,                                       // v_cmp_le_u32 vcc, 40, v0
+        0xBE94_246A,                                       // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0006,                                       // s_cbranch_execz restore
+        0xBE8C_107E,                                       // s_bcnt1_i32_b64 s12, exec
+        0xBF89_0001,                                       // s_cbranch_execnz join
+        if high_only { 0xBEFF_0380 } else { 0xBEFE_04C1 }, // s_mov_b32 exec_hi, 0 or s_mov_b64 exec, -1
+        0xBE8D_107E,                                       // join: s_bcnt1_i32_b64 s13, exec
+        0x7E1A_020D,                                       // v_mov_b32 v13, s13
+        0x4A06_1A0C,                                       // v_add_nc_u32 v3, s12, v13
+        0xBEFE_0414,                                       // restore: s_mov_b64 exec, s[20:21]
+    ])
+}
+
+/// Both scalar lane reads happen under an EXEC mask with no low lanes.
+fn literal_lane_reads(first: bool) -> Vec<u32> {
+    let read: &[u32] = if first {
+        &[0x7E14_0500] // v_readfirstlane_b32 s10, v0
+    } else {
+        &[0xD760_000A, 0x0201_6500] // v_readlane_b32 s10, v0, 50
+    };
+    let mut body = vec![
+        0x7D86_00A8,                           // v_cmp_le_u32 vcc, 40, v0
+        0xBE94_246A,                           // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0000 | (read.len() as u32 + 1), // s_cbranch_execz restore
+    ];
+    body.extend(read);
+    body.extend([
+        0x7E06_020A, // v_mov_b32 v3, s10
+        0xBEFE_0414, // restore: s_mov_b64 exec, s[20:21]
+    ]);
+    // The first-lane case also names the console lanes.
+    body.extend([0xD765_0001, 0x0001_00C1]); // v_mbcnt_lo_u32_b32 v1, -1, 0
+    literal_program(&body)
+}
+
+/// Separate writes select the upper half before reading its first lane.
+fn literal_exec_dwords() -> Vec<u32> {
+    literal_program(&[
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        0xBF88_0002, // s_cbranch_execz restore
+        0x7E14_0500, // v_readfirstlane_b32 s10, v0
+        0x7E06_020A, // v_mov_b32 v3, s10
+        0xBEFE_0414, // restore: s_mov_b64 exec, s[20:21]
+    ])
+}
+
+/// Lane 40 is inactive when the scalar write targets it.
+fn literal_lane_write() -> Vec<u32> {
+    literal_program(&[
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0005, // s_cbranch_execz restore
+        0xD761_0003,
+        0x0001_50B7, // v_writelane_b32 v3, 55, 40
+        0xD760_000A,
+        0x0201_5103, // v_readlane_b32 s10, v3, 40
+        0x7E06_020A, // v_mov_b32 v3, s10
+        0xBEFE_0414, // restore: s_mov_b64 exec, s[20:21]
+    ])
+}
+
+/// Lanes leave independently as their counter reaches zero. SCC is set
+/// only when every bit of EXEC compares equal to zero.
+fn literal_mask_loop(mask_eq: bool) -> Vec<u32> {
+    let mut body = vec![
+        0x3602_0083, // v_and_b32 v1, 3, v0
+        0xBE98_047E, // s_mov_b64 s[24:25], exec
+        0x7D82_0280, // v_cmp_lt_u32 vcc, 0, v1
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF88_0008, // s_cbranch_execz done
+        0xD760_000A,
+        0x0201_0F00, // top: v_readlane_b32 s10, v0, 7
+        0x4A06_060A, // v_add_nc_u32 v3, s10, v3
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D82_0280, // v_cmp_lt_u32 vcc, 0, v1
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF12_807E, // s_cmp_eq_u64 exec, 0
+        0xBF84_FFF8, // s_cbranch_scc0 top
+        0xBEFE_0418, // done: s_mov_b64 exec, s[24:25]
+    ];
+    if !mask_eq {
+        body.remove(11);
+        body[4] = 0xBF88_0007; // s_cbranch_execz done
+        body[11] = 0xBF89_FFF9; // s_cbranch_execnz top
+    }
+    literal_program(&body)
+}
+
+/// Repeated swizzles keep the first lane number of each half.
+fn literal_swizzles() -> Vec<u32> {
+    let mut body = vec![V_MOV_V3_V0];
+    for _ in 0..12 {
+        body.extend([
+            0xD8D4_80B1,
+            0x0300_0003, // ds_swizzle_b32 v3, v3 quad_perm:[1,0,3,2]
+            S_WAITCNT_LGKM,
+            0xD8D4_0020,
+            0x0300_0003, // ds_swizzle_b32 v3, v3 broadcast lane 1 of each half
+            S_WAITCNT_LGKM,
+        ]);
+    }
+    body.extend([
+        0x7D86_00A8, // v_cmp_le_u32 vcc, 40, v0
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0003, // s_cbranch_execz restore
+        0xD760_000A,
+        0x0201_6503, // v_readlane_b32 s10, v3, 50
+        0x7E06_020A, // v_mov_b32 v3, s10
+        0xBEFE_0414, // restore: s_mov_b64 exec, s[20:21]
+    ]);
+    literal_program(&body)
+}
+
+/// Active lanes in both halves write under EXEC and then read their peers.
+fn literal_lds() -> Vec<u32> {
+    literal_program(&[
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x3602_009F, // v_and_b32 v1, 31, v0
+        0x7D86_0290, // v_cmp_le_u32 vcc, 16, v1
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0006, // s_cbranch_execz restore
+        0xD834_0000,
+        0x0000_0002, // ds_write_b32 v2, v0
+        S_WAITCNT_LGKM,
+        0xD8D8_0000,
+        0x0300_0004, // ds_read_b32 v3, v4
+        S_WAITCNT_LGKM,
+        0xBEFE_0414, // restore: s_mov_b64 exec, s[20:21]
+    ])
+}
+
+/// The compiler's whole-wave sum of lanes 20 through 63.
+fn literal_sum() -> Vec<u32> {
+    let sum = reduction(V_ADD_F32, 0x80, 0x7E06_0D00);
+    let steps = &sum[PROLOGUE.len() + 1..sum.len() - 3];
+    let mut body = vec![
+        0x7D86_0094,                            // v_cmp_le_u32 vcc, 20, v0
+        0xBE94_246A,                            // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0000 | (steps.len() as u32 + 1), // s_cbranch_execz restore
+    ];
+    body.extend(steps);
+    body.extend([
+        0x7E06_0301, // v_mov_b32 v3, v1
+        0xBEFE_0414, // restore: s_mov_b64 exec, s[20:21]
+    ]);
+    literal_program(&body)
+}
+
+/// Lane 0 adds 2048 to 1 twice, rounding each addition to 2048 in f16.
+fn literal_half_sum() -> Vec<u32> {
+    let sum = reduction(0x32, 0x80, V_MOV_V3_V0);
+    let mut body = vec![
+        0x7D86_0083, // v_cmp_le_u32 vcc, 3, v0
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0x8AFE_6A7E, // s_andn2_b64 exec, exec, vcc
+        0xBF88_0000, // s_cbranch_execz restore
+        0x7E06_02FF,
+        0x0000_3C00, // v_mov_b32 v3, 1.0 in f16
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xD501_0003,
+        0x01A9_FF03, // v_cndmask_b32 v3, v3, 2048.0 in f16, vcc
+        0x0000_6800,
+    ];
+    body.extend(&sum[PROLOGUE.len() + 2..sum.len() - 3]);
+    body.extend([
+        0x7E06_0301, // v_mov_b32 v3, v1
+        0xBEFE_0414, // restore: s_mov_b64 exec, s[20:21]
+    ]);
+    body[3] |= (body.len() - 5) as u32;
+    literal_program(&body)
+}
+
+#[test]
+fn literal_wave64_recovers_refusals_in_exactly_one_wave() {
+    for (words, lds, reason) in [
+        (literal_mask_join(false), 0, "a lane mask read as data"),
+        (
+            literal_mask_join(true),
+            0,
+            "a lane mask whose lanes depend on its own value",
+        ),
+        (literal_lane_reads(false), 0, "a lane read that may cross"),
+        (literal_lane_reads(true), 0, "a first-lane read"),
+        (literal_exec_dwords(), 0, "a lane mask holding lanes elsewhere read as data"),
+        (literal_lane_write(), 0, "a lane read that may cross"),
+        (literal_mask_loop(false), 0, "a lane read that may cross"),
+        (literal_mask_loop(true), 0, "a lane read that may cross"),
+        (literal_swizzles(), 0, "a lane read that may cross"),
+        (
+            literal_lds(),
+            512,
+            "LDS one console wave64 shares without barriers",
+        ),
+        (
+            literal_sum(),
+            0,
+            "a wave reduction over both 32-lane halves",
+        ),
+        (
+            literal_half_sum(),
+            0,
+            "a wave reduction over both 32-lane halves",
+        ),
+    ] {
+        let n = native(&words, true, 64, lds);
+        let why = lowered_with(&n, true, true).err().expect(reason);
+        assert!(why.to_string().contains(reason), "{why}");
+        let l = lower_halves(&n, true, true, true).unwrap_or_else(|e| panic!("{reason}: {e}"));
+        assert_eq!(l.wave_size, Some(32));
+        if lds != 0 {
+            assert_eq!(l.split_barriers, 1);
+        }
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut l.dxil.clone()).expect(reason);
+        }
+    }
+    let words = literal_lane_reads(false);
+    for threads in [48, 96, 128] {
+        let n = native(&words, true, threads, 0);
+        let why = lower_halves(&n, true, true, true)
+            .err()
+            .expect("literal is limited to 64 threads");
+        assert!(
+            why.to_string().contains("a lane read that may cross"),
+            "{why}"
+        );
+    }
+}
+
+#[test]
+fn literal_wave64_refuses_a_selector_from_hardware_state() {
+    let words = literal_program(&[
+        0xB909_0004, // s_getreg_b32 s9, hwreg(HW_ID)
+        0xD760_000A,
+        0x0200_1300, // v_readlane_b32 s10, v0, s9
+        0x7E06_020A, // v_mov_b32 v3, s10
+    ]);
+    let n = native(&words, true, 64, 512);
+    let why = lower_halves(&n, true, false, true)
+        .err()
+        .expect("unproven lane selector");
+    assert!(
+        why.to_string().contains("a lane read that may cross"),
+        "{why}"
+    );
+}
+
+#[test]
+fn literal_wave64_refuses_a_barrier_under_an_unproven_branch() {
+    let mut words = literal_lds();
+    let at = words.iter().position(|&w| w == 0xBF88_0006).unwrap();
+    words.splice(
+        at..=at,
+        [
+            0xB909_0004, // s_getreg_b32 s9, hwreg(HW_ID)
+            0xBF06_8009, // s_cmp_eq_u32 s9, 0
+            0xBF84_0006, // s_cbranch_scc0 restore
+        ],
+    );
+    let n = native(&words, true, 64, 512);
+    let why = lower_halves(&n, true, true, true)
+        .err()
+        .expect("unproven group convergence");
+    assert!(
+        why.to_string().contains("uniform group control flow"),
+        "{why}"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn literal_wave64_programs_match_the_console_on_every_gpu() {
+    let cases: [(Vec<u32>, u32, Vec<u32>); 12] = [
+        (
+            literal_mask_join(false),
+            0,
+            (0..64).map(|l| 48 * u32::from(l >= 40)).collect(),
+        ),
+        (
+            literal_mask_join(true),
+            0,
+            (0..64).map(|l| 48 * u32::from(l >= 40)).collect(),
+        ),
+        (
+            literal_lane_reads(false),
+            0,
+            (0..64).map(|l| 50 * u32::from(l >= 40)).collect(),
+        ),
+        (
+            literal_lane_reads(true),
+            0,
+            (0..64).map(|l| 40 * u32::from(l >= 40)).collect(),
+        ),
+        (
+            literal_exec_dwords(),
+            0,
+            (0..64).map(|l| 32 * u32::from(l >= 32)).collect(),
+        ),
+        (
+            literal_lane_write(),
+            0,
+            (0..64).map(|l| 55 * u32::from(l < 20 || l == 40)).collect(),
+        ),
+        (
+            literal_mask_loop(false),
+            0,
+            (0..64).map(|l| 7 * (l & 3)).collect(),
+        ),
+        (
+            literal_mask_loop(true),
+            0,
+            (0..64).map(|l| 7 * (l & 3)).collect(),
+        ),
+        (literal_swizzles(), 0, (0..64).map(|l| l & 32).collect()),
+        (
+            literal_lds(),
+            512,
+            (0..64)
+                .map(|l| if (l & 31) >= 16 { l ^ 32 } else { 0 })
+                .collect(),
+        ),
+        (
+            literal_sum(),
+            0,
+            (0..64)
+                .map(|l| if l >= 20 { 1826f32.to_bits() } else { 0 })
+                .collect(),
+        ),
+        (
+            literal_half_sum(),
+            0,
+            (0..64).map(|l| if l < 3 { 0x6800 } else { 0 }).collect(),
+        ),
+    ];
+    for (words, lds, want) in cases {
+        let failed = differences_in(true, &words, 64, 1, &want, lds, true, true);
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
 }

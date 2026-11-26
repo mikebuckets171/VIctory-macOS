@@ -49,14 +49,20 @@ pub enum Atom {
     Lane(Value),
     /// An SCC value, the same in every lane.
     Uniform(Value),
+    /// Some lane of the console wave satisfies the predicate.
+    Any(Bool),
     /// A lane mask joined at a block entry, by its low dword's phi.
     Phi(Value),
+    /// A literal mask join by its exact pair of dword values.
+    PairPhi(Value, Value),
     /// `s_wqm` result: some lane of the quad is in the source mask.
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
     /// EXEC write it does not follow): the lane's bit of the register pair
     /// this value is a dword of.
     Opaque(Value),
+    /// A literal mask held in two scalar dwords.
+    OpaquePair(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
@@ -430,7 +436,7 @@ impl Bools {
 pub enum LaneExit {
     Jump(usize),
     /// To `taken` in lanes where `when` holds. A condition over
-    /// [`Atom::Uniform`]s only is a uniform branch.
+    /// [`Atom::Uniform`] and [`Atom::Any`] predicates is a uniform branch.
     Branch {
         when: Bool,
         taken: usize,
@@ -440,10 +446,16 @@ pub enum LaneExit {
     Indirect,
 }
 
-/// A [`Program`] as one lane runs it: same blocks, per-lane branches.
+/// Lane conditions and branches of a [`Program`].
 #[derive(Debug, Clone)]
 pub struct Structured {
     pub bools: Bools,
+    /// Every lane follows the console wave through the blocks.
+    pub(crate) literal: bool,
+    /// The incoming lane predicates of each literal mask join.
+    pub(crate) mask_inputs: Map<Key, Vec<Bool>>,
+    /// SCC values computed by votes over a mask in literal mode.
+    pub(crate) scc_votes: Map<Value, Bool>,
     /// Per block.
     pub exits: Vec<LaneExit>,
     /// Per block and instruction: the condition, beyond reaching it, under
@@ -461,6 +473,7 @@ pub struct Structured {
     pub other: Map<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
+    paired_other: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: Map<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -476,6 +489,21 @@ pub struct Structured {
 }
 
 impl Structured {
+    pub(crate) fn select_mask(&self, low: Value, high: Option<Value>) -> Option<Bool> {
+        if self.literal {
+            let key = (low, high?);
+            self.paired_masks
+                .get(&key)
+                .or_else(|| self.paired_other.get(&key))
+                .copied()
+        } else {
+            self.masks
+                .get(&low)
+                .or_else(|| self.other.get(&low))
+                .copied()
+        }
+    }
+
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
@@ -498,8 +526,16 @@ pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
     structure_as(program, false)
 }
 
+/// Builds the whole-wave form with the console's EXEC at each vector use.
+pub(crate) fn split_literal(program: &Program) -> Result<Structured, ShaderError> {
+    let mut l = Lanes::new(program, true)?;
+    let execs = l.masks_in_order();
+    let reach = vec![Bool::TRUE; program.blocks.len()];
+    l.finish(&execs, &reach)
+}
+
 fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+    let mut l = Lanes::new(program, false)?;
     if !helpers {
         l.kills.clear();
     }
@@ -521,6 +557,8 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    literal: bool,
+    pair_joins: Map<Key, Vec<Key>>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -540,6 +578,7 @@ struct Lanes<'a> {
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
     scc_lane: Map<Value, Bool>,
+    scc_votes: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
     /// Per block: what a lane knows on entry, over forward edges only.
@@ -577,7 +616,7 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, literal: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -607,6 +646,8 @@ impl<'a> Lanes<'a> {
         }
         let mut l = Lanes {
             p,
+            literal,
+            pair_joins: Map::default(),
             order,
             index,
             incoming,
@@ -617,6 +658,7 @@ impl<'a> Lanes<'a> {
             masks: Map::default(),
             other: Map::default(),
             scc_lane: Map::default(),
+            scc_votes: Map::default(),
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
@@ -624,7 +666,7 @@ impl<'a> Lanes<'a> {
             restored: Map::default(),
             kills: HashSet::new(),
         };
-        for block in blocks {
+        for block in blocks.iter().filter(|_| !literal) {
             if let Exit::Branch { taken, not_taken } = block.exit
                 && let Some(last) = block.insts.last()
                 && let Some(live) = l.discards(last)
@@ -720,11 +762,13 @@ impl<'a> Lanes<'a> {
         for n in 0..self.order.len() {
             let b = self.order[n];
             let mut c = if n == 0 { Bool::TRUE } else { Bool::FALSE };
-            for k in 0..self.incoming[b].len() {
-                let (q, taken) = self.incoming[b][k];
-                if self.index[q] < n {
-                    let e = self.edge(self.first[q], q, taken);
-                    c = self.b.or(c, e);
+            if !self.literal {
+                for k in 0..self.incoming[b].len() {
+                    let (q, taken) = self.incoming[b][k];
+                    if self.index[q] < n {
+                        let e = self.edge(self.first[q], q, taken);
+                        c = self.b.or(c, e);
+                    }
                 }
             }
             self.first[b] = c;
@@ -756,7 +800,7 @@ impl<'a> Lanes<'a> {
                     let m = self.mask(old).0;
                     self.masks.insert(new, m);
                     if let Some(scc) = inst.write(Reg::Scc) {
-                        self.scc_lane.insert(scc, m);
+                        self.record_scc(scc, m, false);
                     }
                 }
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
@@ -766,7 +810,7 @@ impl<'a> Lanes<'a> {
             if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                let mut w = self.branch(last);
+                let mut w = self.raw_when(last);
                 // A discard's "no lane is left" exit: no lane takes it (the
                 // live mask keeps every lane, see `kills`).
                 if let Some(live) = self.discards(last)
@@ -829,6 +873,14 @@ impl<'a> Lanes<'a> {
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
         let blocks = &self.p.blocks;
+        // Resolve back-edge inputs after every definition has been visited.
+        let mut mask_inputs = Map::default();
+        while !self.pair_joins.is_empty() {
+            for (pair, args) in std::mem::take(&mut self.pair_joins) {
+                let incoming = args.into_iter().map(|a| self.mask(a).0).collect();
+                mask_inputs.insert(pair, incoming);
+            }
+        }
         let b = &mut self.b;
         let guards = blocks
             .iter()
@@ -845,6 +897,9 @@ impl<'a> Lanes<'a> {
                         (None, _)
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
+                        }
+                        (&Some(e), _) if self.literal => {
+                            (e != Bool::TRUE && inst.name() != "v_writelane_b32").then_some(e)
                         }
                         (&Some(e), _) => {
                             if let Some((prev, guard)) = last_guard
@@ -868,7 +923,11 @@ impl<'a> Lanes<'a> {
                 Exit::End => LaneExit::End,
                 Exit::Indirect => LaneExit::Indirect,
                 Exit::Branch { taken, not_taken } => LaneExit::Branch {
-                    when: b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]),
+                    when: if self.literal {
+                        self.when[n].unwrap_or(Bool::FALSE)
+                    } else {
+                        b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n])
+                    },
                     taken,
                     not_taken,
                 },
@@ -877,17 +936,30 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        // A partially overwritten pair can be read as a mask, but its two
+        // dwords do not denote a single numeric definition.
+        let words = self.masks.iter().filter(|&(&(lo, hi), _)| {
+            !self.literal
+                || self.defs.get(&lo) == self.defs.get(&hi)
+                    && self.phis.get(&lo).map(|x| x.0) == self.phis.get(&hi).map(|x| x.0)
+        });
         Ok(Structured {
-            masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            literal: self.literal,
+            mask_inputs,
+            scc_votes: self.scc_votes,
+            masks: words.clone().map(|(&(lo, _), &m)| (lo, m)).collect(),
             other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
-            highs: self
-                .masks
-                .keys()
-                .filter(|(lo, hi)| lo != hi)
-                .map(|&(lo, hi)| (hi, lo))
+            highs: words
+                .filter(|&(&(lo, hi), _)| lo != hi)
+                .map(|(&(lo, hi), _)| (hi, lo))
                 .collect(),
             paired_masks: if self.p.wave64 {
                 self.masks
+            } else {
+                Map::default()
+            },
+            paired_other: if self.literal {
+                self.other
             } else {
                 Map::default()
             },
@@ -966,7 +1038,12 @@ impl<'a> Lanes<'a> {
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
                 let m = m.unwrap_or_else(|| {
                     let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
+                    let atom = if self.literal {
+                        Atom::OpaquePair(k.0, k.1)
+                    } else {
+                        Atom::Opaque(k.0)
+                    };
+                    self.b.atom(atom, born)
                 });
                 (m, derived)
             }
@@ -1017,6 +1094,13 @@ impl<'a> Lanes<'a> {
             && forward.iter().all(|f| f.1 == m)
         {
             return Some((m, derived));
+        }
+        if self.literal {
+            self.pair_joins.insert(k, args);
+            return Some((
+                self.b.atom(Atom::PairPhi(k.0, k.1), self.index[block]),
+                derived,
+            ));
         }
         if !self.unresolved.contains(&id) {
             for value in [true, false] {
@@ -1125,7 +1209,11 @@ impl<'a> Lanes<'a> {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
                 let born = self.born(scc);
-                let u = self.b.atom(Atom::Uniform(scc), born);
+                let u = self
+                    .scc_votes
+                    .get(&scc)
+                    .copied()
+                    .unwrap_or_else(|| self.b.atom(Atom::Uniform(scc), born));
                 (self.b.ite(u, a, c), None)
             }
             _ => {
@@ -1211,7 +1299,7 @@ impl<'a> Lanes<'a> {
                         }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
-                        self.scc_lane.insert(scc, m);
+                        self.record_scc(scc, m, false);
                     }
                 }
                 // `s_cmp_eq/lg` of a mask: "no lane differs" per lane.
@@ -1232,7 +1320,7 @@ impl<'a> Lanes<'a> {
                     } else {
                         ne
                     };
-                    self.scc_lane.insert(scc, m);
+                    self.record_scc(scc, m, rest.starts_with("eq"));
                 }
             }
             Fields::Valu(v) => {
@@ -1353,18 +1441,25 @@ impl<'a> Lanes<'a> {
         false
     }
 
-    /// The per-lane condition under which a block's closing branch is taken.
-    fn branch(&mut self, inst: &Inst) -> Bool {
+    /// The closing branch before simplification by its block's reach.
+    fn raw_when(&mut self, inst: &Inst) -> Bool {
         let exec = self.exec(inst);
         match inst.name() {
-            "s_cbranch_execz" => self.b.not(exec),
-            "s_cbranch_execnz" => exec,
+            n @ ("s_cbranch_execz" | "s_cbranch_execnz") => {
+                let any = self.any(exec, 0);
+                if n.ends_with("nz") {
+                    any
+                } else {
+                    self.b.not(any)
+                }
+            }
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
                 let vcc = match self.key(|r| inst.read(r), VCC) {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
+                let masked = self.b.and(vcc, exec);
+                let any = self.any(masked, 0);
                 if n.ends_with("nz") {
                     any
                 } else {
@@ -1375,7 +1470,7 @@ impl<'a> Lanes<'a> {
                 let Some(scc) = inst.read(Reg::Scc) else {
                     return Bool::FALSE;
                 };
-                let set = match self.scc_lane.get(&scc) {
+                let set = match self.scc_votes.get(&scc).or(self.scc_lane.get(&scc)) {
                     Some(&m) => m,
                     None => {
                         let born = self.born(scc);
@@ -1388,6 +1483,25 @@ impl<'a> Lanes<'a> {
                     self.b.not(set)
                 }
             }
+        }
+    }
+
+    fn any(&mut self, bit: Bool, born: usize) -> Bool {
+        if self.literal && bit != Bool::FALSE && bit != Bool::TRUE {
+            self.b.atom(Atom::Any(bit), born)
+        } else {
+            bit
+        }
+    }
+
+    fn record_scc(&mut self, scc: Value, bit: Bool, all: bool) {
+        if self.literal {
+            let test = if all { self.b.not(bit) } else { bit };
+            let voted = self.any(test, self.born(scc));
+            let voted = if all { self.b.not(voted) } else { voted };
+            self.scc_votes.insert(scc, voted);
+        } else {
+            self.scc_lane.insert(scc, bit);
         }
     }
 

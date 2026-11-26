@@ -155,6 +155,12 @@ fn narrow_waves() -> bool {
     })
 }
 
+/// Whether 64-thread wave64 shaders keep only the per-lane translation.
+fn literal_halves_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("VICTORY_LITERAL_HALVES").as_deref() == Ok("0"))
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -175,23 +181,25 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, their
-/// rounds and umax reduction, bias as gradients, narrow waves): their own
-/// cache entries, one per combination.
+/// rounds and umax reduction, bias as gradients, narrow waves, and literal
+/// halves): their own cache entries, one per combination.
 pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
     let locks = options.atomic_locks;
     let bias = options.bias_as_gradients;
     let narrow = options.narrow_waves;
     let rounds = locks && options.atomic_lock_rounds;
     let umax = rounds && options.atomic_umax;
-    if !locks && !bias && !narrow {
+    let no_literal = options.host_wave32 && options.disable_literal_halves;
+    if !locks && !bias && !narrow && !no_literal {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
+    static BUILDS: [OnceLock<[u8; 32]>; 64] = [const { OnceLock::new() }; 64];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(rounds) << 3
-        | usize::from(umax) << 4;
+        | usize::from(umax) << 4
+        | usize::from(no_literal) << 5;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -209,6 +217,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if narrow {
             h.update(b"narrow waves");
+        }
+        if no_literal {
+            h.update(b"literal halves disabled");
         }
         *h.finalize().as_bytes()
     })
@@ -228,6 +239,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
+        disable_literal_halves: literal_halves_disabled(),
     }
 }
 
@@ -543,6 +555,23 @@ mod tests {
         assert!(!rounds_on(true, Some("0")), "0 goes back to the turns");
         assert!(!rounds_on(false, None), "no rounds without the locks");
         assert!(!rounds_on(false, Some("1")), "nor when asked for");
+    }
+
+    #[test]
+    fn disabling_literal_halves_changes_the_translation_key() {
+        let options = victory_shader::emit::Options {
+            host_wave32: true,
+            ..runtime_options()
+        };
+        let on = translation_build(victory_shader::emit::Options {
+            disable_literal_halves: false,
+            ..options
+        });
+        let off = translation_build(victory_shader::emit::Options {
+            disable_literal_halves: true,
+            ..options
+        });
+        assert_ne!(on, off);
     }
 
     fn shader() -> HostShader {

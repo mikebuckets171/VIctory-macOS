@@ -131,8 +131,13 @@ pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(u
 /// itself), and the regions and the scalars are narrowed together to a
 /// fixed point. With an indirect branch, the blocks each lane runs once.
 pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
+    group_uniform(p, st).0
+}
+
+/// Blocks reached together and scalar values computed alike by the group.
+pub(super) fn group_uniform(p: &Program, st: &Structured) -> (Vec<bool>, Set<Value>) {
     let Some(regions) = halves::branch_regions(st) else {
-        return once_per_lane(p);
+        return (once_per_lane(p), Set::default());
     };
     let n = p.blocks.len();
     let scalar = |r: Reg| matches!(r, Reg::S(_) | Reg::Scc);
@@ -171,17 +176,23 @@ pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
                 )
         }))
         .collect();
+    let tracked = |v| {
+        st.literal
+            && (st.masks.contains_key(&v)
+                || st.highs.contains_key(&v)
+                || st.scc_votes.contains_key(&v))
+    };
     loop {
         let mut step = vec![true; n];
         for (d, region) in &regions {
             let LaneExit::Branch { when, .. } = st.exits[*d] else {
                 continue;
             };
-            let together = st
-                .bools
-                .support(when)
-                .iter()
-                .all(|a| matches!(a, Atom::Uniform(v) if alike.contains(v)));
+            let together = st.bools.support(when).iter().all(|a| match *a {
+                Atom::Uniform(v) => alike.contains(&v),
+                Atom::Any(_) => st.literal,
+                _ => false,
+            });
             if !together {
                 for (b, &r) in region.iter().enumerate() {
                     step[b] &= !r;
@@ -198,7 +209,9 @@ pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
             // Every host wave enters by the same edge.
             let entered = step[b] && block.preds.iter().all(|&q| step[q]);
             for phi in &block.phis {
-                if scalar(phi.reg) && entered && phi.args.iter().all(|a| alike.contains(a)) {
+                if scalar(phi.reg)
+                    && (tracked(phi.value) || entered && phi.args.iter().all(|a| alike.contains(a)))
+                {
                     next.insert(phi.value);
                 }
             }
@@ -206,14 +219,26 @@ pub(crate) fn in_step(p: &Program, st: &Structured) -> Vec<bool> {
                 let from = inst
                     .reads
                     .iter()
-                    .all(|&(r, v)| scalar(r) && !mask(r) && alike.contains(&v));
-                if from && !own(inst) {
-                    next.extend(inst.writes.iter().filter(|w| scalar(w.0)).map(|w| w.1));
-                }
+                    .all(|&(r, v)| scalar(r) && (!mask(r) || tracked(v)) && alike.contains(&v));
+                let lane_read = st.literal
+                    && step[b]
+                    && match inst.name() {
+                        "v_readfirstlane_b32" => true,
+                        "v_readlane_b32" => {
+                            halves::uniform_selector(inst, &alike)
+                                && inst.writes.first()
+                                    .and_then(|w| st.restored.get(&w.1))
+                                    .is_none_or(|source| alike.contains(source))
+                        }
+                        _ => false,
+                    };
+                next.extend(inst.writes.iter().filter_map(|&(r, v)| {
+                    (scalar(r) && (tracked(v) || from && !own(inst) || lane_read)).then_some(v)
+                }));
             }
         }
         if next.len() == alike.len() {
-            return step;
+            return (step, next);
         }
         alike = next;
     }
