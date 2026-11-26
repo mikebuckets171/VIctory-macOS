@@ -240,20 +240,27 @@ pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
 ) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
-    let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
+    static LIST: Mutex<Option<HostList>> = Mutex::new(None);
+    let taken = LIST.lock().unwrap_or_else(|e| e.into_inner()).take();
     crate::texture::recycle();
-    match &guard.0 {
+    let list = match taken {
         // Closed by the last submission, which has run.
-        Some(list) => list.reset(),
+        Some(list) => {
+            list.reset();
+            list
+        }
         // Made open.
         None => {
             let list = crate::host::host()?.new_list().ok()?;
             list.set_ours();
-            guard.0 = Some(list);
+            list
         }
-    }
-    let list = guard.0.as_ref()?;
+    };
+    let uploads = Uploads {
+        list: Some(list),
+        pool: &LIST,
+    };
+    let list = uploads.list();
     // What to bring up: the textures lists read through tables, and those
     // the heaps view that shaders read lately. Collected under the heaps'
     // locks and brought up without them, several at a time: reading title
@@ -321,22 +328,29 @@ pub(crate) fn uploads(
         unsafe { list.list.ResourceBarrier(&readable) };
     }
     list.close();
-    // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    // A list recording nothing is not run (dropping `uploads` returns it to
+    // `LIST` for the next submission).
+    recorded.then_some(uploads)
 }
 
-/// The upload list, used under its lock only.
-pub(crate) struct Holder(Option<HostList>);
-// SAFETY: D3D12 objects are free-threaded; the list is used by one
-// submission at a time, under the lock.
-unsafe impl Send for Holder {}
-
-/// The upload list of a submission, ours until it has run.
-pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
+/// The upload list of a submission, owned until the submission's GPU fence
+/// completes; dropping returns it to the reuse slot for the next submission.
+pub(crate) struct Uploads {
+    list: Option<HostList>,
+    pool: &'static Mutex<Option<HostList>>,
+}
 
 impl Uploads {
     pub(crate) fn list(&self) -> &HostList {
-        self.0.0.as_ref().expect("made before it is handed out")
+        self.list.as_ref().expect("made before it is handed out")
+    }
+}
+
+impl Drop for Uploads {
+    fn drop(&mut self) {
+        if let Some(list) = self.list.take() {
+            *self.pool.lock().unwrap_or_else(|e| e.into_inner()) = Some(list);
+        }
     }
 }
 

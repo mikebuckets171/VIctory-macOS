@@ -85,9 +85,40 @@ pub(crate) struct Pumped {
     pub(crate) unknown: u32,
 }
 
+/// Predicate checking whether a ready segment can join an in-progress
+/// coalesced batch.
+#[cfg(any(windows, test))]
+pub(crate) type CanJoin<'a, S> = &'a dyn Fn(&[(S, bool)], &S) -> bool;
+
+/// One ready step popped from [`Held`] so the caller can release the `HELD`
+/// lock while running it on the host GPU.
+#[cfg(any(windows, test))]
+pub(crate) enum Ready<S> {
+    /// Ready segments popped as one host submission (from one queue, or
+    /// coalesced across queues and bottom-of-pipe dependencies when
+    /// `coalesce` is enabled), paired with whether a global UAV barrier must
+    /// precede each segment, plus any mid-batch `Item::Signal`s to attach
+    /// behind the submission. Every queue in `queues` stays marked running
+    /// until [`Held::finish_running`] is called so later submissions and
+    /// signals on those queues wait behind it.
+    Segments {
+        queues: Vec<usize>,
+        segments: Vec<(S, bool)>,
+        signals: Vec<(usize, u64)>,
+        waited: Vec<(usize, Duration)>,
+        unknown: u32,
+        coalesced_bop_waits: u32,
+        hazard_splits: u32,
+    },
+    /// A fence signal ready at the head of a queue with no preceding segments.
+    Signal { fence: usize, value: u64 },
+}
+
 /// Every queue's held work.
 pub(crate) struct Held<S> {
     queues: Vec<(usize, Fifo<S>)>,
+    /// Queues whose popped segments are currently launching outside the lock.
+    running: Vec<usize>,
 }
 
 /// A queue's items, each with when it was pushed and whether it is fresh
@@ -102,7 +133,10 @@ impl<S> Default for Held<S> {
 
 impl<S> Held<S> {
     pub(crate) const fn new() -> Self {
-        Held { queues: Vec::new() }
+        Held {
+            queues: Vec::new(),
+            running: Vec::new(),
+        }
     }
 }
 
@@ -215,14 +249,265 @@ impl<S> Held<S> {
             .collect()
     }
 
-    /// Whether no queue holds anything.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.queues.is_empty()
+    /// Pops the next ready batch of segments or ready fence signal so the
+    /// caller can drop the `HELD` lock before invoking the host GPU.
+    /// When `coalesce` is `true`, accumulates ready segments across all
+    /// non-running queues (including segments whose memory waits are satisfied
+    /// by an earlier segment's deferred bottom-of-pipe writes via `will_write`,
+    /// gated at cross-queue / BoP / fence-wait boundaries by `can_join`) and
+    /// defers mid-batch `Item::Signal`s into `Ready::Segments::signals`.
+    /// When [`Ready::Segments`] is returned, the caller must call
+    /// [`Self::finish_running`] with `queues` once the submission call returns.
+    #[cfg(any(windows, test))]
+    pub(crate) fn take_ready_with(
+        &mut self,
+        read: &dyn Fn(u64, u8) -> Option<u64>,
+        fence: &dyn Fn(usize) -> u64,
+        will_write: &dyn Fn(&S, &ValueWait) -> bool,
+        can_join: CanJoin<'_, S>,
+        coalesce: bool,
+    ) -> Option<Ready<S>> {
+        if !coalesce {
+            return self.take_ready_per_queue(read, fence);
+        }
+        let mut piece: Vec<(S, bool)> = Vec::new();
+        let mut signals: Vec<(usize, u64)> = Vec::new();
+        let mut queues_touched: Vec<usize> = Vec::new();
+        let mut waited: Vec<(usize, Duration)> = Vec::new();
+        let mut unknown = 0u32;
+        let mut coalesced_bop_waits = 0u32;
+        let mut hazard_splits = 0u32;
+        let mut last_queue: Option<usize> = None;
+        let mut split_now = false;
+
+        let mark_touched = |touched: &mut Vec<usize>, q: usize| {
+            if !touched.contains(&q) {
+                touched.push(q);
+            }
+        };
+
+        loop {
+            let mut moved = false;
+            for (queue, items) in &mut self.queues {
+                if self.running.contains(queue) {
+                    continue;
+                }
+                let mut pending_fence_barrier = false;
+                let mut popped_pending_waits: Vec<(Item<S>, Instant, bool)> = Vec::new();
+                loop {
+                    match items.front_mut() {
+                        None => break,
+                        Some((Item::FenceWait(f, v), _, fresh)) => {
+                            let mem_ok = fence(*f) >= *v;
+                            let pending_ok = !mem_ok
+                                && signals.iter().any(|&(sf, sv)| sf == *f && sv >= *v);
+                            if !mem_ok && !pending_ok {
+                                *fresh = false;
+                                break;
+                            }
+                            if let Some(entry) = items.pop_front() {
+                                if pending_ok {
+                                    pending_fence_barrier = true;
+                                    popped_pending_waits.push(entry);
+                                }
+                                moved = true;
+                            }
+                        }
+                        Some((Item::Signal(..), ..)) => {
+                            if piece.is_empty() && signals.is_empty() {
+                                if let Some((Item::Signal(f, v), ..)) = items.pop_front() {
+                                    self.queues.retain(|(_, q)| !q.is_empty());
+                                    return Some(Ready::Signal { fence: f, value: v });
+                                }
+                                break;
+                            }
+                            if let Some((Item::Signal(f, v), ..)) = items.pop_front() {
+                                popped_pending_waits.clear();
+                                signals.push((f, v));
+                                mark_touched(&mut queues_touched, *queue);
+                                moved = true;
+                            }
+                        }
+                        Some((Item::Segment(seg, waits), since, fresh)) => {
+                            let mut ok = true;
+                            let mut via_bop = 0u32;
+                            let mut seg_unknown = 0u32;
+                            for wait in waits.iter() {
+                                match wait.holds(read) {
+                                    Some(true) => {}
+                                    Some(false) => {
+                                        if piece
+                                            .iter()
+                                            .rev()
+                                            .any(|(prev, _)| will_write(prev, wait))
+                                        {
+                                            via_bop += 1;
+                                        } else {
+                                            ok = false;
+                                        }
+                                    }
+                                    None => seg_unknown += 1,
+                                }
+                            }
+                            let is_join_boundary = !piece.is_empty()
+                                && (last_queue != Some(*queue)
+                                    || via_bop > 0
+                                    || pending_fence_barrier);
+                            if !ok {
+                                *fresh = false;
+                                unknown += seg_unknown;
+                                for entry in popped_pending_waits.drain(..).rev() {
+                                    items.push_front(entry);
+                                }
+                                break;
+                            }
+                            if is_join_boundary && !can_join(&piece, seg) {
+                                hazard_splits += 1;
+                                split_now = true;
+                                for entry in popped_pending_waits.drain(..).rev() {
+                                    items.push_front(entry);
+                                }
+                                break;
+                            }
+                            if !*fresh {
+                                waited.push((*queue, since.elapsed()));
+                            }
+                            unknown += seg_unknown;
+                            coalesced_bop_waits += via_bop;
+                            let barrier_before =
+                                via_bop > 0 || std::mem::take(&mut pending_fence_barrier);
+                            popped_pending_waits.clear();
+                            if let Some((Item::Segment(s, _), ..)) = items.pop_front() {
+                                piece.push((s, barrier_before));
+                                last_queue = Some(*queue);
+                                mark_touched(&mut queues_touched, *queue);
+                                moved = true;
+                            }
+                        }
+                    }
+                }
+                for entry in popped_pending_waits.drain(..).rev() {
+                    items.push_front(entry);
+                }
+                if split_now {
+                    break;
+                }
+            }
+            if split_now || !moved {
+                break;
+            }
+        }
+        self.queues.retain(|(_, items)| !items.is_empty());
+        if !piece.is_empty() {
+            for &q in &queues_touched {
+                if !self.running.contains(&q) {
+                    self.running.push(q);
+                }
+            }
+            return Some(Ready::Segments {
+                queues: queues_touched,
+                segments: piece,
+                signals,
+                waited,
+                unknown,
+                coalesced_bop_waits,
+                hazard_splits,
+            });
+        }
+        None
     }
 
-    /// Whether `queue` holds anything.
+    #[cfg(any(windows, test))]
+    fn take_ready_per_queue(
+        &mut self,
+        read: &dyn Fn(u64, u8) -> Option<u64>,
+        fence: &dyn Fn(usize) -> u64,
+    ) -> Option<Ready<S>> {
+        for (queue, items) in &mut self.queues {
+            if self.running.contains(queue) {
+                continue;
+            }
+            let mut segments = Vec::new();
+            let mut waited = Vec::new();
+            let mut unknown = 0u32;
+            loop {
+                match items.front_mut() {
+                    None => break,
+                    Some((Item::FenceWait(f, v), _, fresh)) => {
+                        if fence(*f) >= *v {
+                            items.pop_front();
+                            continue;
+                        }
+                        *fresh = false;
+                        break;
+                    }
+                    Some((Item::Signal(..), ..)) => {
+                        if !segments.is_empty() {
+                            break;
+                        }
+                        if let Some((Item::Signal(f, v), ..)) = items.pop_front() {
+                            self.queues.retain(|(_, q)| !q.is_empty());
+                            return Some(Ready::Signal { fence: f, value: v });
+                        }
+                        break;
+                    }
+                    Some((Item::Segment(_, waits), since, fresh)) => {
+                        let mut ok = true;
+                        for wait in waits.iter() {
+                            match wait.holds(read) {
+                                Some(true) => {}
+                                Some(false) => ok = false,
+                                None => unknown += 1,
+                            }
+                        }
+                        if !ok {
+                            *fresh = false;
+                            break;
+                        }
+                        if !*fresh {
+                            waited.push((*queue, since.elapsed()));
+                        }
+                        if let Some((Item::Segment(s, _), ..)) = items.pop_front() {
+                            segments.push((s, false));
+                        }
+                    }
+                }
+            }
+            if !segments.is_empty() {
+                let q = *queue;
+                self.running.push(q);
+                return Some(Ready::Segments {
+                    queues: vec![q],
+                    segments,
+                    signals: Vec::new(),
+                    waited,
+                    unknown,
+                    coalesced_bop_waits: 0,
+                    hazard_splits: 0,
+                });
+            }
+        }
+        self.queues.retain(|(_, items)| !items.is_empty());
+        None
+    }
+
+    /// Clears the running markers set by [`Self::take_ready_with`] once the
+    /// popped batch has been handed to the host GPU.
+    #[cfg(any(windows, test))]
+    pub(crate) fn finish_running(&mut self, queues: &[usize]) {
+        self.running.retain(|q| !queues.contains(q));
+        self.queues.retain(|(_, items)| !items.is_empty());
+    }
+
+    /// Whether no queue holds anything and none is currently running.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.running.is_empty() && self.queues.is_empty()
+    }
+
+    /// Whether `queue` holds anything or has a popped batch still launching.
     pub(crate) fn holds_work(&self, queue: usize) -> bool {
-        self.queues.iter().any(|(q, items)| *q == queue && !items.is_empty())
+        self.running.contains(&queue)
+            || self.queues.iter().any(|(q, items)| *q == queue && !items.is_empty())
     }
 
     /// Releases work held longer than `limit` at the heads of blocked
@@ -440,5 +725,115 @@ mod tests {
         assert_eq!(forced, [(2, vec![ge(0x100, 1)])]);
         pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q2: stuck"]);
+    }
+
+    #[test]
+    fn take_ready_marks_queue_running_until_finished() {
+        let mut held = Held::default();
+        held.push(1, Item::Segment("a", vec![]));
+        held.push(1, Item::Signal(9, 1));
+        held.push(1, Item::Segment("b", vec![]));
+        let read = |_: u64, _| Some(0u64);
+        let fence = |_: usize| 0u64;
+        let no_write = |_: &&str, _: &ValueWait| false;
+        let no_join = |_: &[(&str, bool)], _: &&str| false;
+
+        match held.take_ready_with(&read, &fence, &no_write, &no_join, false) {
+            Some(Ready::Segments {
+                queues, segments, ..
+            }) => {
+                assert_eq!(queues, [1]);
+                assert_eq!(segments, [("a", false)]);
+            }
+            _ => panic!("expected segments"),
+        }
+        // Queue 1 is marked running: holds_work stays true and take_ready_with
+        // must not pop its queued Signal before finish_running(&[1]).
+        assert!(held.holds_work(1));
+        assert!(!held.is_empty());
+        assert!(held
+            .take_ready_with(&read, &fence, &no_write, &no_join, false)
+            .is_none());
+
+        held.finish_running(&[1]);
+        match held.take_ready_with(&read, &fence, &no_write, &no_join, false) {
+            Some(Ready::Signal { fence: f, value }) => assert_eq!((f, value), (9, 1)),
+            _ => panic!("expected signal"),
+        }
+        match held.take_ready_with(&read, &fence, &no_write, &no_join, false) {
+            Some(Ready::Segments {
+                queues, segments, ..
+            }) => {
+                assert_eq!(queues, [1]);
+                assert_eq!(segments, [("b", false)]);
+            }
+            _ => panic!("expected trailing segment"),
+        }
+        held.finish_running(&[1]);
+        assert!(!held.holds_work(1));
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn take_ready_coalesced_merges_cross_queue_bop_and_deferred_signals() {
+        let mut held = Held::default();
+        // Queue 2 waits on BoP 0x100 >= 1 written by Queue 1's segment "g1".
+        held.push(2, Item::Segment("c1", vec![ge(0x100, 1)]));
+        // Queue 3 waits on fence 9 >= 1 signalled after "g1".
+        held.push(3, Item::FenceWait(9, 1));
+        held.push(3, Item::Segment("c2", vec![]));
+        // Queue 1 produces "g1" (writes 0x100 = 1), signals fence 9, then "g2".
+        held.push(1, Item::Segment("g1", vec![]));
+        held.push(1, Item::Signal(9, 1));
+        held.push(1, Item::Segment("g2", vec![]));
+
+        let read = |_: u64, _| Some(0u64);
+        let fence = |_: usize| 0u64;
+        let will_write = |seg: &&str, wait: &ValueWait| *seg == "g1" && wait.address == 0x100;
+        let can_join = |_: &[(&str, bool)], next: &&str| *next != "c2";
+
+        // First coalesced batch picks up Queue 1 ("g1", deferred Signal(9,1), "g2")
+        // AND Queue 2 ("c1" via BoP with barrier_before=true), then splits before
+        // Queue 3 ("c2") because `can_join` rejects it at the join boundary.
+        match held.take_ready_with(&read, &fence, &will_write, &can_join, true) {
+            Some(Ready::Segments {
+                queues,
+                segments,
+                signals,
+                coalesced_bop_waits,
+                hazard_splits,
+                ..
+            }) => {
+                assert_eq!(queues, [1, 2]);
+                assert_eq!(segments, [("g1", false), ("g2", false), ("c1", true)]);
+                assert_eq!(signals, [(9, 1)]);
+                assert_eq!(coalesced_bop_waits, 1);
+                assert_eq!(hazard_splits, 1);
+            }
+            _ => panic!("expected coalesced batch"),
+        }
+        assert!(held.holds_work(1));
+        assert!(held.holds_work(2));
+        held.finish_running(&[1, 2]);
+
+        // Queue 3's FenceWait(9, 1) was restored when "c2" split out, so "c2"
+        // stays blocked until fence 9 actually reaches 1.
+        assert!(held
+            .take_ready_with(&read, &fence, &will_write, &can_join, true)
+            .is_none());
+
+        // Once the first batch's signal (9, 1) has landed, Queue 3's "c2" runs.
+        let fence_after = |f: usize| if f == 9 { 1 } else { 0 };
+        match held.take_ready_with(&read, &fence_after, &will_write, &can_join, true) {
+            Some(Ready::Segments {
+                queues, segments, ..
+            }) => {
+                assert_eq!(queues, [3]);
+                assert_eq!(segments, [("c2", false)]);
+            }
+            _ => panic!("expected c2 after fence"),
+        }
+        held.finish_running(&[3]);
+        assert!(held.is_empty());
     }
 }

@@ -4,8 +4,11 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
+mod flight;
+pub(crate) use flight::{async_submit_enabled, flight1_enabled};
+
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -54,9 +57,37 @@ impl Drop for Holding {
 
 /// Submissions held off ([`Host::quiet`]).
 pub(crate) struct Quiet<'a> {
-    // Dropped in this order: the mark, then the lock.
-    _holding: Holding,
-    _held: std::sync::MutexGuard<'a, u64>,
+    holding: Option<Holding>,
+    held: Option<std::sync::MutexGuard<'a, u64>>,
+    landed: bool,
+}
+
+impl Drop for Quiet<'_> {
+    fn drop(&mut self) {
+        // Drop in strict order: thread-local flag, then submission lock, and
+        // only after releasing `submitted` notify held queues if a flight landed.
+        self.holding.take();
+        self.held.take();
+        if self.landed {
+            crate::queue::on_flight_landed();
+        }
+    }
+}
+
+/// Prepared submission artifacts owned between `prepare_submission` and
+/// `finish_post_gpu`.
+struct PreparedSubmission {
+    lists: Vec<Option<ID3D12CommandList>>,
+    #[cfg(feature = "diagnostics")]
+    firsts: Vec<usize>,
+    native_boundaries: Vec<usize>,
+    batch: Batch,
+    heaps: Vec<std::sync::Arc<crate::bindless::Viewed>>,
+    uploads: Option<crate::bindless::Uploads>,
+    started: std::time::Instant,
+    prepared: std::time::Instant,
+    #[cfg(feature = "diagnostics")]
+    traced: bool,
 }
 
 pub(crate) struct Host {
@@ -73,6 +104,13 @@ pub(crate) struct Host {
     /// Extra marks for native calls before the final call of a split submission.
     split_marks: Mutex<Option<Vec<Mark>>>,
     event: HANDLE,
+    /// Separate fence event waited on exclusively by `victory-flight` outside
+    /// `Host::submitted`.
+    flight_event: HANDLE,
+    /// At-most-one active GPU flight and title fence signals queued behind it.
+    flight: Mutex<flight::FlightState>,
+    /// Wakes `victory-flight` whenever a new flight is launched.
+    flight_wake: Condvar,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
     /// A ring of depth views, used as `rtvs`.
@@ -332,6 +370,7 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
+        let flight_event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -375,6 +414,9 @@ fn create() -> windows::core::Result<Host> {
             mark: OnceLock::new(),
             split_marks: Mutex::new(Some(Vec::new())),
             event,
+            flight_event,
+            flight: Mutex::new(flight::FlightState::default()),
+            flight_wake: Condvar::new(),
             rtvs,
             rtv_size,
             dsvs,
@@ -1601,16 +1643,28 @@ impl Host {
     /// itself. A late event left set by an earlier wait cannot end a later
     /// wait early, as the fence is checked after every wake-up too.
     fn wait_for(&self, value: u64) {
+        self.wait_for_on_event(self.event, value, 1000);
+    }
+
+    /// Waits until the host fence reaches `value`, polling `event` every
+    /// `poll_ms` milliseconds so a dropped D3DMetal event (#50) never hangs.
+    pub(super) fn wait_for_on_event(&self, event: HANDLE, value: u64, poll_ms: u32) {
         use std::sync::atomic::AtomicU64;
         static MISSED: AtomicU64 = AtomicU64::new(0);
-        let mut seconds = 0u32;
+        let started = std::time::Instant::now();
+        let mut next_log_secs = 1u64;
+        let mut logged_hang = false;
         loop {
+            // SAFETY: our fence.
+            if unsafe { self.fence.GetCompletedValue() } >= value {
+                return;
+            }
             // SAFETY: our event and fence.
-            let woke = unsafe { WaitForSingleObject(self.event, 1000) };
+            let woke = unsafe { WaitForSingleObject(event, poll_ms) };
             // SAFETY: as above.
             let completed = unsafe { self.fence.GetCompletedValue() };
             if completed >= value {
-                if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                if woke != windows::Win32::Foundation::WAIT_OBJECT_0 && started.elapsed().as_millis() >= 1000 {
                     let n = MISSED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_power_of_two() {
                         tracing::warn!(n, value, completed, "a host submission finished without setting its event; went on after checking the fence");
@@ -1619,11 +1673,13 @@ impl Host {
                 return;
             }
             if woke != windows::Win32::Foundation::WAIT_OBJECT_0 {
-                seconds += 1;
-                if seconds.is_power_of_two() {
+                let seconds = started.elapsed().as_secs();
+                if seconds >= next_log_secs {
                     tracing::warn!(seconds, value, completed, "still waiting for the host GPU");
+                    next_log_secs = (next_log_secs * 2).max(seconds + 1);
                 }
-                if seconds == 8 {
+                if !logged_hang && seconds >= 8 {
+                    logged_hang = true;
                     let what = WAITING_ON.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     tracing::error!(%what, value, "host GPU hang: the submission waited on");
                 }
@@ -1741,16 +1797,241 @@ impl Host {
         if !crate::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
             return None;
         }
-        let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        Some(Quiet { _holding: Holding::enter(), _held: held })
+        let mut held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let holding = Holding::enter();
+        // Ensure the GPU is completely idle before descriptor heap creation /
+        // null-fill begins (VIctory-macOS issue #31).
+        let landed = self.finish_flight_locked(&mut held, None, None);
+        Some(Quiet {
+            holding: Some(holding),
+            held: Some(held),
+            landed,
+        })
     }
 
-    /// Runs closed lists and waits for them.
+    /// Runs closed lists and waits for them. Drains any queued async-submit
+    /// work and any active Flight-1 submission first so synchronous callers
+    /// observe strictly ordered GPU state.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        if !HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+            crate::queue::before_sync();
+        }
+        self.execute_sync(runs);
+    }
+
+    /// Runs closed lists synchronously under `self.submitted`, finishing any
+    /// active Flight-1 submission first.
+    pub(crate) fn execute_sync(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
+        self.finish_flight_locked(&mut submitted, None, None);
+
+        #[cfg(feature = "diagnostics")]
+        let gpu_timing = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let gpu_timing = false;
+
+        let mut prep = self.prepare_submission(&submitted, runs, gpu_timing);
+        let run_refs: Vec<&HostList> = prep
+            .uploads
+            .as_ref()
+            .map(|u| u.list())
+            .into_iter()
+            .chain(runs.iter().copied())
+            .collect();
+        let runs = &run_refs[..];
+
+        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        #[cfg(feature = "diagnostics")]
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if gpu_timing {
+            prep.firsts
+                .iter()
+                .zip(prep.firsts.iter().skip(1).chain([&prep.lists.len()]))
+                .map(|(&a, &b)| &prep.lists[a..b])
+                .collect()
+        } else {
+            vec![&prep.lists[..]]
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let groups = [&prep.lists[..]];
+        let mut removed_in = None;
+        let mark = self.mark();
+        // A failed earlier call may leave the queue able to run the final mark.
+        // Give each native call its own mark so failure recovery can see it.
+        if mark.is_none() {
+            prep.native_boundaries.clear();
+        }
+        let mut split_pool = (!prep.native_boundaries.is_empty())
+            .then(|| self.split_marks.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(pool) = split_pool.as_deref_mut() {
+            if let Some(marks) = pool.as_mut()
+                && let Err(error) = (marks.len()..prep.native_boundaries.len()).try_for_each(|_| {
+                    marks.push(Mark::new(self)?);
+                    Ok::<_, windows::core::Error>(())
+                })
+            {
+                tracing::warn!(
+                    %error,
+                    "could not make split submission marks, keeping the native batch together"
+                );
+                *pool = None;
+            }
+            if pool.is_none() {
+                prep.native_boundaries.clear();
+            }
+        }
+        let split_marks = split_pool
+            .as_deref()
+            .and_then(Option::as_deref)
+            .unwrap_or(&[]);
+        for (i, group) in groups.iter().enumerate() {
+            *submitted += 1;
+            let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            // Last, the list that shows the submission ran.
+            let mut group = group.to_vec();
+            if let Some(mark) = mark {
+                mark.arm(*submitted);
+                group.push(mark.list());
+            }
+            let queue = self.queue();
+            // SAFETY: closed lists; the fence and event are ours.
+            let waited = unsafe {
+                // All native calls share the existing fence signal and wait.
+                let mut first = 0;
+                for (&end, mark) in prep.native_boundaries.iter().zip(split_marks) {
+                    mark.arm(*submitted);
+                    let mut marked = group[first..end].to_vec();
+                    marked.push(mark.list());
+                    #[cfg(test)]
+                    tests::native_call(marked.len());
+                    queue.ExecuteCommandLists(&marked);
+                    first = end;
+                }
+                #[cfg(test)]
+                tests::native_call(group.len() - first);
+                queue.ExecuteCommandLists(&group[first..]);
+                let waited = queue
+                    .Signal(&self.fence, *submitted)
+                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                match waited {
+                    Ok(()) => {
+                        self.wait_for(*submitted);
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "host submission not waited for");
+                        false
+                    }
+                }
+            };
+            #[cfg(test)]
+            tests::native_call_group(waited);
+            if waited
+                && let Some(mark) = mark
+                && (!mark.saw(*submitted)
+                    || split_marks
+                        .iter()
+                        .take(prep.native_boundaries.len())
+                        .any(|m| !m.saw(*submitted)))
+                // SAFETY: a plain query.
+                && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
+            {
+                self.lost(&mut submitted, mark);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+            #[cfg(feature = "diagnostics")]
+            if groups.len() > 1 {
+                // SAFETY: a plain query.
+                let frequency = unsafe { queue.GetTimestampFrequency() }.unwrap_or(1);
+                gpu_times(
+                    started.elapsed(),
+                    &runs[i].slowest(frequency, usize::MAX).unwrap_or_default(),
+                );
+            }
+            #[cfg(feature = "diagnostics")]
+            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+                // SAFETY: a plain query.
+                let frequency = unsafe { queue.GetTimestampFrequency() }.unwrap_or(1);
+                let commands = runs[i]
+                    .notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len();
+                tracing::warn!(
+                    ms = started.elapsed().as_millis(),
+                    commands,
+                    "slow host list"
+                );
+                match runs[i].slowest(frequency, 6) {
+                    Some(slowest) => {
+                        for (ms, op) in slowest {
+                            tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                        }
+                    }
+                    None => {
+                        static SAID: std::sync::Once = std::sync::Once::new();
+                        SAID.call_once(|| {
+                            tracing::warn!(
+                                frequency,
+                                "GPU timestamps do not advance on this adapter: \
+                                 slow lists are timed whole, their commands are not"
+                            )
+                        });
+                    }
+                }
+            }
+            if groups.len() > 1 && removed_in.is_none() {
+                // SAFETY: a plain query.
+                if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                    removed_in = Some(i);
+                }
+            }
+            let _ = (i, started);
+        }
+        drop(split_pool);
+        self.finish_post_gpu(
+            runs,
+            prep.batch,
+            prep.heaps,
+            prep.started,
+            prep.prepared,
+            prep.prepared.elapsed(),
+            removed_in,
+        );
+        // A listed frame: what this submission's lists drew, as it is now
+        // (the dumps submit lists of their own).
+        #[cfg(feature = "diagnostics")]
+        if prep.traced {
+            let sub = *submitted;
+            let mut targets: Vec<(usize, String)> = Vec::new();
+            for r in runs {
+                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                    if !targets.iter().any(|x| x.0 == t.0) {
+                        targets.push(t.clone());
+                    }
+                }
+            }
+            drop(run_refs);
+            drop(prep.uploads);
+            drop(submitted);
+            crate::capture::dump_submission(sub, &targets);
+        }
+    }
+
+    /// Prepares a submission under `self.submitted` once any prior flight has
+    /// finished: evicts unused textures, syncs descriptor heaps, records
+    /// texture uploads, runs deferred CPU copies/refreshes, and builds preludes.
+    fn prepare_submission(
+        &self,
+        submitted: &u64,
+        runs: &[&HostList],
+        gpu_timing: bool,
+    ) -> PreparedSubmission {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1809,13 +2090,13 @@ impl Host {
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
-        let runs: Vec<&HostList> = uploads
+        let run_refs: Vec<&HostList> = uploads
             .as_ref()
             .map(|u| u.list())
             .into_iter()
             .chain(runs.iter().copied())
             .collect();
-        let runs = &runs[..];
+        let runs = &run_refs[..];
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -1835,10 +2116,6 @@ impl Host {
                 }
             }
         }
-        #[cfg(feature = "diagnostics")]
-        let gpu_timing = timing();
-        #[cfg(not(feature = "diagnostics"))]
-        let gpu_timing = false;
         let split_preludes = !gpu_timing && split_uav_srv_prelude();
         let mut native_boundaries = Vec::new();
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
@@ -1861,52 +2138,14 @@ impl Host {
         batch.flush();
         #[cfg(feature = "diagnostics")]
         batch.log_refreshes(*submitted + 1, runs.len());
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = submitted;
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if gpu_timing {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
-        let mut removed_in = None;
-        let mark = self.mark();
-        // A failed earlier call may leave the queue able to run the final mark.
-        // Give each native call its own mark so failure recovery can see it.
-        if mark.is_none() {
-            native_boundaries.clear();
-        }
-        let mut split_pool = (!native_boundaries.is_empty())
-            .then(|| self.split_marks.lock().unwrap_or_else(|e| e.into_inner()));
-        if let Some(pool) = split_pool.as_deref_mut() {
-            if let Some(marks) = pool.as_mut()
-                && let Err(error) = (marks.len()..native_boundaries.len()).try_for_each(|_| {
-                    marks.push(Mark::new(self)?);
-                    Ok::<_, windows::core::Error>(())
-                })
-            {
-                tracing::warn!(
-                    %error,
-                    "could not make split submission marks, keeping the native batch together"
-                );
-                *pool = None;
-            }
-            if pool.is_none() {
-                native_boundaries.clear();
-            }
-        }
-        let split_marks = split_pool
-            .as_deref()
-            .and_then(Option::as_deref)
-            .unwrap_or(&[]);
+        crate::copystat::add(
+            crate::copystat::C::FaultsPrep,
+            crate::copystat::page_faults().saturating_sub(faults),
+        );
         if !native_boundaries.is_empty() {
             static FIRST_SPLIT: std::sync::Once = std::sync::Once::new();
             FIRST_SPLIT.call_once(|| {
@@ -1929,107 +2168,38 @@ impl Host {
                 .collect();
             format!("{} lists, pipelines {pipelines:?}", runs.len())
         };
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
-            let started = std::time::Instant::now();
+        drop(run_refs);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = firsts;
+        PreparedSubmission {
+            lists,
             #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-            // Last, the list that shows the submission ran.
-            let mut group = group.to_vec();
-            if let Some(mark) = mark {
-                mark.arm(*submitted);
-                group.push(mark.list());
-            }
-            let queue = self.queue();
-            // SAFETY: closed lists; the fence and event are ours.
-            let waited = unsafe {
-                // All native calls share the existing fence signal and wait.
-                let mut first = 0;
-                for (&end, mark) in native_boundaries.iter().zip(split_marks) {
-                    mark.arm(*submitted);
-                    let mut marked = group[first..end].to_vec();
-                    marked.push(mark.list());
-                    #[cfg(test)]
-                    tests::native_call(marked.len());
-                    queue.ExecuteCommandLists(&marked);
-                    first = end;
-                }
-                #[cfg(test)]
-                tests::native_call(group.len() - first);
-                queue.ExecuteCommandLists(&group[first..]);
-                let waited = queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        self.wait_for(*submitted);
-                        true
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "host submission not waited for");
-                        false
-                    }
-                }
-            };
-            #[cfg(test)]
-            tests::native_call_group(waited);
-            if waited
-                && let Some(mark) = mark
-                && (!mark.saw(*submitted)
-                    || split_marks.iter().take(native_boundaries.len()).any(|m| !m.saw(*submitted)))
-                // SAFETY: a plain query.
-                && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
-            {
-                self.lost(&mut submitted, mark);
-            }
+            firsts,
+            native_boundaries,
+            batch,
+            heaps,
+            uploads,
+            started,
+            prepared,
             #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 {
-                // SAFETY: a plain query.
-                let frequency = unsafe { queue.GetTimestampFrequency() }.unwrap_or(1);
-                gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX).unwrap_or_default());
-            }
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i]
-                    .notes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .len();
-                tracing::warn!(
-                    ms = started.elapsed().as_millis(),
-                    commands,
-                    "slow host list"
-                );
-                match runs[i].slowest(frequency, 6) {
-                    Some(slowest) => {
-                        for (ms, op) in slowest {
-                            tracing::warn!("slow list command, {ms:.1} ms: {op}");
-                        }
-                    }
-                    None => {
-                        static SAID: std::sync::Once = std::sync::Once::new();
-                        SAID.call_once(|| {
-                            tracing::warn!(
-                                frequency,
-                                "GPU timestamps do not advance on this adapter: \
-                                 slow lists are timed whole, their commands are not"
-                            )
-                        });
-                    }
-                }
-            }
-            // SAFETY: a plain query.
-            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-                removed_in = Some(i);
-            }
-            let _ = (i, started);
+            traced,
         }
-        let _ = &firsts;
-        let gpu = prepared.elapsed();
+    }
+
+    /// Runs post-GPU completion work under `self.submitted` after the host
+    /// fence has completed: timing/removal checks, mark & shadow copy-back,
+    /// `after` callbacks, bottom-of-pipe writes, retirement, and info-queue logs.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_post_gpu(
+        &self,
+        runs: &[&HostList],
+        batch: Batch,
+        heaps: Vec<std::sync::Arc<crate::bindless::Viewed>>,
+        started: std::time::Instant,
+        prepared: std::time::Instant,
+        gpu: std::time::Duration,
+        removed_in: Option<usize>,
+    ) {
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
@@ -2069,7 +2239,8 @@ impl Host {
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
-        let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
+        let mut index: std::collections::HashMap<(usize, usize, usize), usize> =
+            std::collections::HashMap::new();
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
         // title's own data (runs c1, c4), and so does what every program
@@ -2113,7 +2284,9 @@ impl Host {
             .collect();
         for b in back.iter_mut().filter(|b| b.3) {
             let copy = std::sync::Arc::as_ptr(&b.0) as usize;
-            b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
+            b.3 = !held
+                .iter()
+                .any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
         }
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.
@@ -2142,11 +2315,7 @@ impl Host {
                 );
             }
         }
-        let total_back_bytes: usize = back
-            .iter()
-            .filter(|b| b.3)
-            .map(|b| b.2)
-            .sum();
+        let total_back_bytes: usize = back.iter().filter(|b| b.3).map(|b| b.2).sum();
         if crate::shadow::parallel_copies_enabled()
             && total_back_bytes >= crate::shadow::PARALLEL_COPY_BACK_MIN_BYTES
         {
@@ -2209,7 +2378,10 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
+        crate::copystat::add(
+            crate::copystat::C::FaultsBack,
+            crate::copystat::page_faults().saturating_sub(faults),
+        );
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
@@ -2220,22 +2392,6 @@ impl Host {
         release_retired();
         release_later(Box::new((batch, back, withheld, heaps)));
         self.log_messages();
-        // A listed frame: what this submission's lists drew, as it is now
-        // (the dumps submit lists of their own).
-        #[cfg(feature = "diagnostics")]
-        if traced {
-            let sub = *submitted;
-            drop(submitted);
-            let mut targets: Vec<(usize, String)> = Vec::new();
-            for r in runs {
-                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                    if !targets.iter().any(|x| x.0 == t.0) {
-                        targets.push(t.clone());
-                    }
-                }
-            }
-            crate::capture::dump_submission(sub, &targets);
-        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
