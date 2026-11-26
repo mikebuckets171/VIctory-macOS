@@ -799,6 +799,7 @@ impl Shadow {
         let mut writes: crate::watch::Runs = Vec::new();
         let mut taken = Vec::new();
         let mut title = Vec::new();
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         for &page in pages {
             let (from, to) = (page.max(start), (page + PAGE).min(end));
             if from >= to {
@@ -837,11 +838,16 @@ impl Shadow {
             if self.has_widened.load(Ordering::Acquire) {
                 self.refresh_widened(from, to);
             }
+            // The declared copy-backs follow this marked one. They must compare
+            // with the merged bytes, or replay them over a newer title write.
+            // A title-only change updates the shadow even when nothing goes back.
+            self.sync_snapshot_in(&mut before, from, to);
             // Equal to title memory now: taken, unless it holds the page in part.
             if from == page && to == page + PAGE {
                 taken.push(page / PAGE);
             }
         }
+        drop(before);
         let mut written = 0;
         for (from, to) in writes {
             let len = to - from;
@@ -3039,6 +3045,53 @@ pub(crate) mod tests {
         assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
         copy.copy_back(p, PAGE + 16);
         unregister(p, p as u64);
+    }
+
+    /// Marked pages retire before the declared ranges in one submission.
+    #[test]
+    fn declared_writeback_preserves_title_writes_after_marked_pages() {
+        let p = crate::watch::tests::pool(3);
+        let start = p + 16;
+        let len = 3 * PAGE - 32;
+        register(p, start as u64, len as u64);
+        let Some(copy) = find(start as u64, len as u64) else {
+            unregister(p, start as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU
+        };
+        copy.update(start, len);
+        copy.writing(start, len, true);
+        copy.writing(start, len, false);
+        // The first and last pages are marked. The first had a shader write;
+        // on the last only the title changed a byte. The middle page has a
+        // shader write still to publish through the declared range.
+        copy.write_host((start + 8) as u64, &[0xa1]);
+        copy.write_host((p + PAGE + 8) as u64, &[0xb2]);
+        // SAFETY: bytes in this test's allocation, freed after the copy.
+        let put = |addr: usize, value: u8| unsafe { (addr as *mut u8).write_volatile(value) };
+        // SAFETY: the same live allocation; both copy-back calls are synchronous.
+        let get = |addr: usize| unsafe { (addr as *const u8).read_volatile() };
+        put(start + 40, 0x11);
+        put(p + 2 * PAGE + 40, 0x22);
+        let marked = copy.copy_back_marked(&[p, p + 2 * PAGE]);
+        assert_eq!(get(start + 8), 0xa1);
+        assert_eq!(get(p + PAGE + 8), 0, "middle page is not marked");
+        put(start + 8, 0x33);
+        put(start + 40, 0x44);
+        put(p + 2 * PAGE + 40, 0x55);
+        let declared = copy.copy_back(start, len);
+        let actual = [
+            get(start + 8),
+            get(start + 40),
+            get(p + PAGE + 8),
+            get(p + 2 * PAGE + 40),
+        ];
+        unregister(p, start as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+        assert_eq!(actual, [0x33, 0x44, 0xb2, 0x55]);
+        assert_eq!(marked, PAGE - 16, "only the first marked page wrote back");
+        assert_eq!(declared, PAGE, "only the unmarked middle page wrote back");
     }
 
     /// Mark bits are handed out in runs and come back joined.
