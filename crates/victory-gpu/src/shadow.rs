@@ -2205,6 +2205,8 @@ pub(crate) fn near(va: u64) -> String {
 
 #[cfg(test)]
 mod parallel_copy_tests;
+#[cfg(test)]
+mod snapshot_bench;
 
 #[cfg(test)]
 pub(crate) mod tests {
