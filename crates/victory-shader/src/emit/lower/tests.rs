@@ -3071,5 +3071,3 @@ fn a_cndmask_with_vccz_as_its_mask_keeps_the_first_lane_refusal() {
         "no cross-half exchange was emitted for the all-zeros mask"
     );
 }
-
-
