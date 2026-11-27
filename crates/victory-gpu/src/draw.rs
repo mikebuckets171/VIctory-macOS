@@ -1750,6 +1750,12 @@ impl State {
         }
     }
 
+    /// The title pipeline the next draw or dispatch runs (null: none set).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn title_pipeline(&self) -> usize {
+        self.pipeline
+    }
+
     /// Flushes any pending RTV probes recorded during `VICTORY_HDR_PROBE`.
     pub(crate) fn flush_hdr_probe(&mut self, list: &HostList) {
         let Some((targets, shaders)) = self.hdr_rtvs.take() else {

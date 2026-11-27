@@ -255,6 +255,71 @@ fn cut_for_clamp(this: This) -> bool {
     true
 }
 
+/// With `VICTORY_GPU_TIMING_CUTS` (diagnostics builds), before a draw or
+/// dispatch (`compute`) is recorded: the title list goes on in a new host
+/// list where a pipeline that gets lists of its own starts or ends, as
+/// [`cut_for_clamp`] moves it on, so that such a timed host list runs one
+/// pipeline and its wall time is that pipeline's (`crate::timing_cuts`).
+/// The command is counted in the list it goes into. Without a new host
+/// list it stays in the current one, under that list's first pipeline.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn cut_for_timing(this: This, compute: bool) {
+    if !crate::host::timing_cuts_on() {
+        return;
+    }
+    let Some(current) = host_list(this) else {
+        return;
+    };
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let pipeline = list
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .title_pipeline();
+    let key = crate::timing_cuts::key(pipeline, compute, crate::host::timing_cut_own(pipeline));
+    let mut into = current;
+    if current.timed_cuts(key)
+        && let Some(next) = next_segment(this)
+    {
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.flush_hdr_probe(current);
+        current.close();
+        state.cut(next);
+        into = next;
+    }
+    into.timed_command(key, || crate::pipeline::shaders_of(pipeline as This));
+}
+
+#[cfg(all(windows, not(feature = "diagnostics")))]
+fn cut_for_timing(_: This, _: bool) {}
+
+/// After [`cut_for_clamp`] moved an indirect execution that
+/// [`cut_for_timing`] had counted in `previous` on to a new host list: it
+/// is counted there instead.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn retime_after_clamp_cut(this: This, previous: Option<&crate::host::HostList>, compute: bool) {
+    let (Some(previous), Some(current)) = (previous, host_list(this)) else {
+        return;
+    };
+    if !crate::host::timing_cuts_on() || std::ptr::eq(previous, current) {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let pipeline = list
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .title_pipeline();
+    previous.timed_command_moved();
+    let key = crate::timing_cuts::key(pipeline, compute, crate::host::timing_cut_own(pipeline));
+    current.timed_command(key, || crate::pipeline::shaders_of(pipeline as This));
+}
+
+#[cfg(all(windows, not(feature = "diagnostics")))]
+fn retime_after_clamp_cut(_: This, _: Option<&crate::host::HostList>, _: bool) {}
+
 /// Moves a title list's recording on to its next host list (made, or one
 /// it held since an earlier recording, reset then): that host list.
 #[cfg(windows)]
@@ -1747,17 +1812,20 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::cut_for_timing(this, false);
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        super::cut_for_timing(this, true);
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchX` with its console flags (`State::dispatch_x`).
     pub(super) fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
         super::count_dispatch();
+        super::cut_for_timing(this, true);
         with_state(this, |list, s| s.dispatch_x(list, x, y, z, flags));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
@@ -1768,6 +1836,7 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
+        super::cut_for_timing(this, false);
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
@@ -1786,6 +1855,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
+        super::cut_for_timing(this, false);
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
@@ -1797,6 +1867,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        super::cut_for_timing(this, false);
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1882,12 +1953,15 @@ extern "system" fn execute_indirect(
         };
         use crate::draw::Indirect;
         let mut outcome = Indirect::NotRun;
+        cut_for_timing(this, kind == DISPATCH);
         with_state(this, |list, s| {
             outcome = s.execute_indirect(list, (kind, stride, max), address, counter, true);
         });
         if outcome == Indirect::CutFirst {
             // Clamped inline in the same host list if no new one can be had.
+            let previous = host_list(this);
             cut_for_clamp(this);
+            retime_after_clamp_cut(this, previous, kind == DISPATCH);
             with_state(this, |list, s| {
                 outcome = s.execute_indirect(list, (kind, stride, max), address, counter, false);
             });

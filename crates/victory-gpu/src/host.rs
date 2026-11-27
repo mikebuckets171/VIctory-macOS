@@ -1565,6 +1565,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_GPU_TIMING_CUTS`: the one kind and pipeline of the
+    /// list's draws or dispatches, once it has any (`crate::timing_cuts`).
+    #[cfg(feature = "diagnostics")]
+    timed: Mutex<Option<crate::timing_cuts::Timed>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
@@ -1603,7 +1607,109 @@ pub(crate) fn dred_on() -> bool {
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING") || timing_cuts_on())
+}
+
+/// Whether a few pipelines at a time get host lists of their own, so that
+/// a timed list of theirs runs one pipeline and its wall time is that
+/// pipeline's (`VICTORY_GPU_TIMING_CUTS`, diagnostics builds; turns the
+/// timing on): GPU time per pipeline where timestamps do not advance, as
+/// under D3DMetal. See `crate::timing_cuts`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn timing_cuts_on() -> bool {
+    *timing_cuts() != crate::timing_cuts::Mode::Off
+}
+
+#[cfg(feature = "diagnostics")]
+fn timing_cuts() -> &'static crate::timing_cuts::Mode {
+    static MODE: OnceLock<crate::timing_cuts::Mode> = OnceLock::new();
+    MODE.get_or_init(|| {
+        let mode = crate::timing_cuts::mode_of(std::env::var("VICTORY_GPU_TIMING_CUTS").ok().as_deref());
+        if mode != crate::timing_cuts::Mode::Off {
+            tracing::info!(
+                ?mode,
+                "VICTORY_GPU_TIMING_CUTS: host lists of their own for a few pipelines at a time, each list \
+                 run and timed on its own"
+            );
+        }
+        mode
+    })
+}
+
+/// A sweep's pipelines and where it is (`VICTORY_GPU_TIMING_CUTS=sweep`).
+#[cfg(feature = "diagnostics")]
+static SWEEP: Mutex<Option<crate::timing_cuts::Sweep>> = Mutex::new(None);
+
+/// Whether the title pipeline `this` gets host lists of its own now: it
+/// has a listed shader (remembered per pipeline, which the title makes
+/// once and keeps), or the sweep is at it.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn timing_cut_own(this: usize) -> bool {
+    use crate::timing_cuts::Mode;
+    if this == 0 {
+        return false;
+    }
+    match timing_cuts() {
+        Mode::Off => false,
+        Mode::Sweep(_) => SWEEP
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .times(this),
+        Mode::Listed(listed) => {
+            static SEEN: Mutex<Option<std::collections::HashMap<usize, bool>>> = Mutex::new(None);
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            *seen
+                .get_or_insert_with(Default::default)
+                .entry(this)
+                .or_insert_with(|| {
+                    crate::timing_cuts::lists(
+                        listed,
+                        &crate::pipeline::shaders_of(this as crate::object::This),
+                    )
+                })
+        }
+    }
+}
+
+/// The timed lists' wall time by pipeline since the last frame-rate line
+/// (`VICTORY_GPU_TIMING_CUTS`).
+#[cfg(feature = "diagnostics")]
+static GPU_WALLS: Mutex<Option<crate::timing_cuts::Walls>> = Mutex::new(None);
+
+/// Logs [`GPU_WALLS`] over `frames` frames: the 40 pipelines that cost most
+/// above the lists' floor, each per frame it had lists in.
+#[cfg(feature = "diagnostics")]
+fn log_gpu_walls(frames: f64) {
+    let Some(walls) = GPU_WALLS.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let (lists, ms, floor, rows) = walls.report(frames);
+    let sweep = match timing_cuts() {
+        crate::timing_cuts::Mode::Sweep(n) => {
+            let mut sweep = SWEEP.lock().unwrap_or_else(|e| e.into_inner());
+            let (now, live) = sweep.get_or_insert_with(Default::default).advance(*n);
+            format!("; the sweep goes on with {now} of the {live} pipelines drawn with")
+        }
+        _ => String::new(),
+    };
+    tracing::info!(
+        "GPU wall time by pipeline: {lists:.1} timed lists/frame, {ms:.1} ms/frame; a list's floor {floor:.3} ms \
+         (tenth percentile); {} lines{sweep}",
+        rows.len()
+    );
+    for r in rows.iter().take(40) {
+        tracing::info!(
+            "  GPU wall {:.2} ms ({:.2} above the floor) in {:.1} lists, {:.1} commands a frame, \
+             in {} frames: {}",
+            r.ms,
+            r.above,
+            r.lists,
+            r.commands,
+            r.frames,
+            r.label
+        );
+    }
 }
 
 /// On D3DMetal, a separate native queue call before a deferred UAV-to-SRV
@@ -2123,6 +2229,8 @@ impl HostGpu for Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                timed: Mutex::default(),
             })
         }
     }
@@ -2301,6 +2409,19 @@ impl Host {
                     started.elapsed(),
                     &runs[i].slowest(frequency, usize::MAX).unwrap_or_default(),
                 );
+            }
+            #[cfg(feature = "diagnostics")]
+            if gpu_timing && timing_cuts_on() {
+                let timed = runs[i].timed.lock().unwrap_or_else(|e| e.into_inner());
+                GPU_WALLS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert_with(Default::default)
+                    .add(
+                        started.elapsed().as_secs_f64() * 1e3,
+                        timed.as_ref(),
+                        crate::queue::presented(),
+                    );
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
@@ -3335,6 +3456,8 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.timed.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.trim_scratch();
         self.reset_hoisted_clamps();
         self.marked.store(false, Ordering::Relaxed);
@@ -3906,6 +4029,51 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
+        }
+    }
+
+    /// With `VICTORY_GPU_TIMING_CUTS`: whether a draw or dispatch of `key`
+    /// (`crate::timing_cuts::key`) belongs in a host list after this one,
+    /// which runs another kind or pipeline.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timed_cuts(&self, (key, compute): (usize, bool)) -> bool {
+        let timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
+        crate::timing_cuts::cuts(timed.as_ref(), key, compute)
+    }
+
+    /// Counts a draw or dispatch of `key` about to be recorded into the
+    /// list, whose kind and pipeline it gives the list if it is the first
+    /// (`name`: the pipeline's shaders).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timed_command(
+        &self,
+        (key, compute): (usize, bool),
+        name: impl FnOnce() -> String,
+    ) {
+        let mut timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
+        match timed.as_mut() {
+            Some(t) => t.commands += 1,
+            None => {
+                *timed = Some(crate::timing_cuts::Timed {
+                    key,
+                    compute,
+                    commands: 1,
+                    name: name(),
+                })
+            }
+        }
+    }
+
+    /// Takes back the last [`HostList::timed_command`]: its command went
+    /// into the next host list after all (a cut for an indirect clamp).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timed_command_moved(&self) {
+        let mut timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = timed.as_mut() {
+            t.commands = t.commands.saturating_sub(1);
+            if t.commands == 0 {
+                *timed = None;
+            }
         }
     }
 
@@ -5918,6 +6086,7 @@ impl Meter {
                 let drops = crate::pipeline::take_drops();
                 crate::frame::log();
                 log_gpu_times(report_frames);
+                log_gpu_walls(report_frames);
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
                 crate::heap_worker::log(report_frames);
