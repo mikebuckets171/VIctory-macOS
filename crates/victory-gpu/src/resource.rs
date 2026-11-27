@@ -242,6 +242,75 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// R8G8B8A8_UNORM, which stands in for a packed 16-bit render target the
+/// host cannot make (see [`target_format`]).
+const RGBA8_UNORM: u32 = 28;
+
+/// The console's packed 16-bit colour formats a title renders to:
+/// B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
+const PACKED_16: [u32; 2] = [86, 115];
+
+/// Whether the host GPU lacks render-target or typed unordered-access
+/// support for `format` (asked once per format). NVIDIA has neither for
+/// B4G4R4A4 and no typed UAV for B5G5R5A1, which Grand Theft Auto VI's
+/// 2560x1440 UI targets need; AMD has both.
+#[cfg(windows)]
+fn host_lacks_target(format: u32) -> bool {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static LACKS: [OnceLock<bool>; 2] = [OnceLock::new(), OnceLock::new()];
+    let Some(i) = PACKED_16.iter().position(|&f| f == format) else {
+        return false;
+    };
+    *LACKS[i].get_or_init(|| {
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: the structure the feature names, ours.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        };
+        let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
+            | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+        let lacks = asked.is_err() || support.Support1.0 & needed != needed;
+        if lacks {
+            tracing::info!(
+                format,
+                "packed 16-bit render targets are R8G8B8A8_UNORM on this GPU"
+            );
+        }
+        lacks
+    })
+}
+
+#[cfg(not(windows))]
+fn host_lacks_target(_: u32) -> bool {
+    false
+}
+
+/// The format a render target or unordered-access texture of `format` is
+/// made in on the host, and that render target views and pipelines name:
+/// R8G8B8A8_UNORM for a packed 16-bit format the GPU cannot render to or
+/// write typed (each channel keeps its value, with more precision); else
+/// the format as the host has it. Textures only sampled keep theirs.
+pub(crate) fn target_format(format: u32) -> u32 {
+    let format = pc_format(format);
+    if PACKED_16.contains(&format) && host_lacks_target(format) {
+        RGBA8_UNORM
+    } else {
+        format
+    }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -1202,7 +1271,12 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    const RENDER_TARGET: u32 = 1;
+    d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+        target_format(d.format)
+    } else {
+        pc_format(d.format)
+    };
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1396,7 +1470,13 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        // The host's flag for a render target (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET).
+        const RENDER_TARGET: u32 = 1;
+        value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+            target_format(value[0])
+        } else {
+            pc_format(value[0])
+        };
         value
     });
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
@@ -1753,19 +1833,77 @@ fn ram_over() -> u64 {
     if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
         return 0;
     }
-    ram_excess(m.ullAvailPhys, m.ullTotalPhys)
+    ram_excess(m.ullAvailPhys, m.ullTotalPhys, ram_marks())
 }
 
 /// With `available` of `total` bytes free: what to give up so that
-/// [`RAM_FREE`] is, once less than [`RAM_LOW`] is.
+/// `marks.free` of the memory is, once less than `marks.low` is.
 #[cfg(windows)]
-fn ram_excess(available: u64, total: u64) -> u64 {
+fn ram_excess(available: u64, total: u64, marks: RamMarks) -> u64 {
     let total = total as f64;
-    if (available as f64) < RAM_LOW * total {
-        (RAM_FREE * total) as u64 - available
+    if (available as f64) < marks.low * total {
+        ((marks.free * total) as u64).saturating_sub(available)
     } else {
         0
     }
+}
+
+/// The shares of the computer's memory that [`ram_excess`] works to:
+/// below `low` free it gives up, until `free` would be.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RamMarks {
+    low: f64,
+    free: f64,
+}
+
+/// The largest share `VICTORY_RAM_LOW` or `VICTORY_RAM_FREE` may name:
+/// above it there would be no room for the title itself.
+#[cfg(windows)]
+const RAM_MARK_MOST: f64 = 0.5;
+
+/// [`RAM_LOW`] and [`RAM_FREE`], or what `VICTORY_RAM_LOW` and
+/// `VICTORY_RAM_FREE` put in their place, read once and logged when they
+/// differ. A tenth is late on a Mac whose memory the title fills: with
+/// 24 GB, macOS was compressing and decompressing about 800 MB a second
+/// in the world while 14 % still counted as free, so nothing was given up
+/// (#454).
+#[cfg(windows)]
+fn ram_marks() -> RamMarks {
+    static MARKS: std::sync::OnceLock<RamMarks> = std::sync::OnceLock::new();
+    *MARKS.get_or_init(|| {
+        let var = |name: &str| std::env::var(name).ok();
+        let marks = ram_marks_from(
+            var("VICTORY_RAM_LOW").as_deref(),
+            var("VICTORY_RAM_FREE").as_deref(),
+        );
+        if marks != ram_marks_from(None, None) {
+            tracing::info!(
+                low = marks.low,
+                free = marks.free,
+                "host textures are given up below `low` of the computer's memory free, until `free` is"
+            );
+        }
+        marks
+    })
+}
+
+/// The marks for the values of `VICTORY_RAM_LOW` and `VICTORY_RAM_FREE`,
+/// each a share of the computer's memory from 0 to [`RAM_MARK_MOST`]. A
+/// value that is not one is left out. `free` without a value of its own
+/// keeps its default distance above `low`, and is never under `low`.
+#[cfg(windows)]
+fn ram_marks_from(low: Option<&str>, free: Option<&str>) -> RamMarks {
+    let share = |value: Option<&str>| {
+        value
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| (0.0..=RAM_MARK_MOST).contains(v))
+    };
+    let low = share(low).unwrap_or(RAM_LOW);
+    let free = share(free)
+        .unwrap_or((low + (RAM_FREE - RAM_LOW)).min(RAM_MARK_MOST))
+        .max(low);
+    RamMarks { low, free }
 }
 
 /// Whether the host card's memory is the computer's own, logged once: its
@@ -2570,9 +2708,48 @@ pub(crate) fn test_buffer(width: u64) -> This {
     out
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_texture_2d(width: u32, height: u32, format: u32, flags: u32) -> This {
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: 3, // D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        alignment: 0,
+        width: u64::from(width),
+        height,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &heap,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::backend::HostGpu;
 
     #[cfg(windows)]
     #[test]
@@ -2831,17 +3008,91 @@ mod tests {
     #[test]
     fn free_memory_below_its_share_gives_up_up_to_the_higher_share() {
         let gb = 1u64 << 30;
-        assert_eq!(ram_excess(4 * gb, 16 * gb), 0);
+        let marks = ram_marks_from(None, None);
+        assert_eq!(ram_excess(4 * gb, 16 * gb, marks), 0);
         assert_eq!(
-            ram_excess(16 * gb / 10 + 1, 16 * gb),
+            ram_excess(16 * gb / 10 + 1, 16 * gb, marks),
             0,
             "just above the line"
         );
         assert_eq!(
-            ram_excess(gb, 16 * gb),
+            ram_excess(gb, 16 * gb, marks),
             (0.15 * (16 * gb) as f64) as u64 - gb
         );
-        assert_eq!(ram_excess(0, 8 * gb), (0.15 * (8 * gb) as f64) as u64);
+        assert_eq!(
+            ram_excess(0, 8 * gb, marks),
+            (0.15 * (8 * gb) as f64) as u64
+        );
+    }
+
+    /// `VICTORY_RAM_LOW` and `VICTORY_RAM_FREE` move the two shares, and
+    /// with them where giving up starts and how far it goes.
+    #[cfg(windows)]
+    #[test]
+    fn the_memory_marks_can_be_set() {
+        let gb = 1u64 << 30;
+        let marks = ram_marks_from(Some("0.20"), Some("0.26"));
+        assert_eq!(
+            marks,
+            RamMarks {
+                low: 0.20,
+                free: 0.26
+            }
+        );
+        assert_eq!(
+            ram_excess(5 * gb, 24 * gb, marks),
+            0,
+            "above a fifth of 24 GB"
+        );
+        assert_eq!(
+            ram_excess(4 * gb, 24 * gb, marks),
+            (0.26 * (24 * gb) as f64) as u64 - 4 * gb
+        );
+        assert_eq!(
+            ram_excess(4 * gb, 24 * gb, ram_marks_from(None, None)),
+            0,
+            "the default marks give nothing up there"
+        );
+    }
+
+    /// Unset, the marks are the constants. `free` follows a `low` set
+    /// alone and is never under it, and a value that is no share of the
+    /// memory changes nothing.
+    #[cfg(windows)]
+    #[test]
+    fn the_memory_marks_keep_their_order_and_ignore_bad_values() {
+        let default = RamMarks {
+            low: RAM_LOW,
+            free: RAM_FREE,
+        };
+        assert_eq!(ram_marks_from(None, None), default);
+        let alone = ram_marks_from(Some(" 0.2 "), None);
+        assert_eq!(alone.low, 0.2);
+        assert!((alone.free - 0.25).abs() < 1e-9, "{alone:?}");
+        assert_eq!(
+            ram_marks_from(Some("0.3"), Some("0.2")),
+            RamMarks {
+                low: 0.3,
+                free: 0.3
+            },
+            "free is never under low"
+        );
+        assert_eq!(
+            ram_marks_from(Some("0.5"), None),
+            RamMarks {
+                low: 0.5,
+                free: 0.5
+            },
+            "free stays within the largest share"
+        );
+        for bad in ["", "20", "-0.1", "0.51", "nan", "inf", "a fifth"] {
+            assert_eq!(ram_marks_from(Some(bad), Some(bad)), default, "{bad:?}");
+        }
+        assert_eq!(
+            ram_excess(0, 16 * (1u64 << 30), ram_marks_from(Some("0"), Some("0"))),
+            0,
+            "zero turns giving up for free memory off"
+        );
     }
 
     /// Textures idle for the idle time and frames are given up; past the

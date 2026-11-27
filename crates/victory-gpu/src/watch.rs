@@ -694,14 +694,22 @@ impl Tracked {
 
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
+    /// Untracked pages (never guarded) are skipped.
     pub(crate) fn taken(&self, pages: &[usize]) {
-        let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        let others = aliases(&g, pages);
-        let unguarded = guard_aliases(&mut g, &others);
-        let pages: Vec<usize> = pages
+        let tracked_pages: Vec<usize> = pages
             .iter()
             .copied()
+            .filter(|&p| !self.is_untracked(p))
+            .collect();
+        if tracked_pages.is_empty() {
+            return;
+        }
+        let mut g = guards();
+        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        let others = aliases(&g, &tracked_pages);
+        let unguarded = guard_aliases(&mut g, &others);
+        let pages: Vec<usize> = tracked_pages
+            .into_iter()
             .filter(|p| !unguarded.contains(p))
             .collect();
         for page in protect(&mut g, &pages) {
@@ -709,6 +717,16 @@ impl Tracked {
             self.changed.taken(page);
         }
         set_dirty(self.changed.2, !changed.is_empty());
+    }
+
+    /// Whether any byte of page `page` (a page number) lies in the tracker's
+    /// untracked parts (never guarded, copied whole at each use).
+    pub(crate) fn is_untracked(&self, page: usize) -> bool {
+        let (a, b) = (
+            page.saturating_mul(PAGE),
+            page.saturating_add(1).saturating_mul(PAGE),
+        );
+        self.untracked.iter().any(|&(u, v)| u < b && a < v)
     }
 
     /// Whether no page changed since it was taken: then [`Tracked::take`]
@@ -1417,6 +1435,8 @@ pub(crate) mod tests {
         // SAFETY: inside our reservation.
         assert!(!unsafe { VirtualAlloc((base + 2 * PAGE) as *const _, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
         let t = track(base, 4 * PAGE, true).expect("reserved memory counts as runtime memory");
+        assert!(!t.is_untracked(base / PAGE) && !t.is_untracked(base / PAGE + 1));
+        assert!(t.is_untracked(base / PAGE + 2) && t.is_untracked(base / PAGE + 3));
         let _ = t.take(base, base + 4 * PAGE);
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -2083,5 +2103,33 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// `Tracked::taken` must never guard pages outside the tracker's runtime
+    /// pages (such as plain committed memory inside a wider shadow window).
+    #[test]
+    fn taken_never_guards_untracked_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualQuery,
+        };
+        // SAFETY: plain reservation and commit of our own memory.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: inside our reservation.
+        assert!(!unsafe { VirtualAlloc((base + 2 * PAGE) as *const _, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        let t = track(base, 4 * PAGE, true).expect("reserved memory counts as runtime memory");
+        assert!(!t.is_untracked(base / PAGE) && !t.is_untracked(base / PAGE + 1));
+        assert!(t.is_untracked(base / PAGE + 2) && t.is_untracked(base / PAGE + 3));
+        let _ = t.take(base, base + 4 * PAGE);
+        t.taken(&[base / PAGE + 2, base / PAGE + 3]);
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery((base + 2 * PAGE) as *const _, &mut info, size_of_val(&info)) };
+        assert_eq!(info.Protect, PAGE_READWRITE, "untracked plain memory must stay writable");
+        drop(t);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }

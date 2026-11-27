@@ -83,30 +83,30 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PadState {
-    buttons: u32,
-    left_trigger: f32,
-    right_trigger: f32,
-    left_x: f32,
-    left_y: f32,
-    right_x: f32,
-    right_y: f32,
+pub(crate) struct PadState {
+    pub(crate) buttons: u32,
+    pub(crate) left_trigger: f32,
+    pub(crate) right_trigger: f32,
+    pub(crate) left_x: f32,
+    pub(crate) left_y: f32,
+    pub(crate) right_x: f32,
+    pub(crate) right_y: f32,
 }
 
 /// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct KeyState {
-    scan_code: u32,
-    code_point: u32,
-    virtual_key: u8,
-    dead_key: bool,
+pub(crate) struct KeyState {
+    pub(crate) scan_code: u32,
+    pub(crate) code_point: u32,
+    pub(crate) virtual_key: u8,
+    pub(crate) dead_key: bool,
 }
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
 /// Host input, or a fake in tests.
-trait Source: Send {
+pub(crate) trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
@@ -415,7 +415,7 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source);
+        let hub = Hub::new(super::gameinput_script::wrap(source));
         hub.poll();
         std::thread::spawn(move || {
             loop {

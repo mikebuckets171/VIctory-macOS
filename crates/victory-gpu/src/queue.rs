@@ -4,6 +4,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+#[cfg(windows)]
+use crate::backend::HostGpu;
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
@@ -718,6 +720,8 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    #[cfg(windows)]
+    crate::hdr_probe::on_present(frame);
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::presented(frame);
@@ -725,6 +729,10 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    #[cfg(windows)]
+    let mut black_frame = false;
+    #[cfg(not(windows))]
+    let black_frame = false;
     #[cfg(windows)]
     let found = plane_resources(planes, plane_parameters);
     #[cfg(windows)]
@@ -752,6 +760,7 @@ extern "system" fn present(
         });
         let overlay = other.as_ref().zip(overlay_state).map(|((_, t), s)| (t, s));
         let shown = host.present(&texture, state, overlay, frame);
+        black_frame = shown.unwrap_or(false);
         if let Some(((o, _), s)) = other.as_ref().zip(overlay_state) {
             crate::resource::host_transition(*o, s);
         }
@@ -763,6 +772,11 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(windows)]
+    let drawn = crate::draw::drawn();
+    #[cfg(not(windows))]
+    let drawn = 0;
+    crate::bench::on_present(drawn, black_frame);
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was

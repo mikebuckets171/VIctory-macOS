@@ -18,6 +18,9 @@
 
 #[cfg(windows)]
 mod alias;
+pub mod bench;
+#[cfg(windows)]
+mod backend;
 #[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -40,6 +43,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(any(windows, test))]
+mod hdr_probe;
 mod hold;
 #[cfg(windows)]
 mod host;

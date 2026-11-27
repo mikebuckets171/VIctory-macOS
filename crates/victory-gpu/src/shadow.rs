@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
+use crate::backend::HostMemory;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
@@ -437,7 +438,7 @@ impl Shadow {
             self.refresh_widened(from, to);
         }
         if let Some(t) = &self.tracked
-            && t.changed(page / PAGE)
+            && (t.changed(page / PAGE) || t.is_untracked(page / PAGE))
         {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -593,7 +594,21 @@ impl Shadow {
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
+        // Marked copy-back relies on write-fault guards to detect CPU writes;
+        // if `[address, address + len)` touches untracked pages (never
+        // guarded), fall back to a declared snapshot so 3-way merge preserves
+        // both GPU and CPU writes.
+        let has_untracked = self.tracked.as_ref().is_some_and(|t| {
+            let (from, to) = self.inside(address as usize, len as usize);
+            let start = self.start as usize;
+            !t.untracked(start + from, start + to).is_empty()
+        });
+        list.defer_gpu_write(
+            self,
+            address as usize,
+            len as usize,
+            marked && self.marked() && !has_untracked,
+        );
         list.mark_widened_write(self, address as usize, len as usize);
     }
 
@@ -827,7 +842,7 @@ impl Shadow {
             // Our own write below must not save the page for this copy again.
             t.unarm(page / PAGE);
             let saved = t.saved(page / PAGE);
-            if saved.is_none() && t.changed(page / PAGE) {
+            if saved.is_none() && (t.changed(page / PAGE) || t.is_untracked(page / PAGE)) {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::MarkedKept, 1);
                 continue;
@@ -2326,6 +2341,7 @@ mod snapshot_bench;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::backend::HostGpu;
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
@@ -2625,6 +2641,141 @@ pub(crate) mod tests {
         unregister(pool, pool as u64);
         // The pages stay allocated (as the other tests' pools): a copy some
         // page table still holds must not name memory reused meanwhile.
+    }
+
+    /// On a shadow spanning a tracked pool page and an untracked plain
+    /// committed page, CPU writes on the untracked page right before
+    /// `copy_back_marked`, `copy_back_page`, or `copy_back` must never be
+    /// clobbered, and the plain page must never be guarded read-only.
+    #[test]
+    fn mixed_shadow_copy_back_preserves_cpu_writes_and_untracked_writability() {
+        use crate::watch::tests::{MEM_WRITE_WATCH, free};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualQuery,
+        };
+        let (pool, plain) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then two
+                // adjacent allocations where it was.
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE)
+                        as usize;
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let at = |q: usize, kind: u32| {
+                        VirtualAlloc(
+                            q as *const _,
+                            PAGE,
+                            MEM_RESERVE | MEM_COMMIT | kind,
+                            PAGE_READWRITE,
+                        ) as usize
+                    };
+                    let (pool, plain) = (at(p, MEM_WRITE_WATCH), at(p + PAGE, 0));
+                    if p != 0 && pool == p && plain == p + PAGE {
+                        return Some((pool, plain));
+                    }
+                    [pool, plain].into_iter().filter(|&q| q != 0).for_each(free);
+                    None
+                }
+            })
+            .expect("two free pages");
+        let len = 2 * PAGE;
+        register(pool, pool as u64, len as u64);
+        let Some(copy) = find(pool as u64, len as u64) else {
+            unregister(pool, pool as u64);
+            [pool, plain].into_iter().for_each(free);
+            return;
+        };
+        let protect_of = |at: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid out pointer.
+            unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        let gpu_word = plain as *mut u32;
+        let cpu_word = (plain + 16) as *mut u32;
+
+        // 1) `copy_back_marked` on the untracked plain page must not clobber a
+        //    CPU write made before copy-back, nor guard the plain page.
+        // SAFETY: bytes inside our plain allocation.
+        unsafe {
+            gpu_word.write_volatile(0x1111_1111);
+            cpu_word.write_volatile(0x2222_2222);
+        }
+        copy.update(pool, len);
+        // Simulate a GPU write to `[0..4)` of `plain` in the shadow buffer.
+        // SAFETY: inside the shadow mapping (`plain` is at offset `PAGE`).
+        unsafe { (copy.data.add(PAGE) as *mut u32).write(0xDEAD_BEEF) };
+        // CPU writes `[16..20)` right before `copy_back_marked`.
+        // SAFETY: bytes inside our plain allocation.
+        unsafe { cpu_word.write_volatile(0xCAFE_BABE) };
+        copy.copy_back_marked(&[plain]);
+        // SAFETY: reading back our plain allocation.
+        let cpu_after = unsafe { cpu_word.read_volatile() };
+        assert_eq!(
+            cpu_after,
+            0xCAFE_BABE,
+            "copy_back_marked must not clobber CPU write on untracked page"
+        );
+        assert_eq!(
+            protect_of(plain),
+            PAGE_READWRITE,
+            "copy_back_marked must not guard untracked plain memory"
+        );
+
+        // 2) `copy_back_page` on the untracked plain page must not clobber a
+        //    CPU write made before copy-back, nor guard the plain page.
+        // SAFETY: bytes inside our plain allocation.
+        unsafe {
+            gpu_word.write_volatile(0x1111_1111);
+            cpu_word.write_volatile(0x2222_2222);
+        }
+        copy.update(pool, len);
+        // SAFETY: inside the shadow mapping.
+        unsafe { (copy.data.add(PAGE) as *mut u32).write(0xDEAD_BEEF) };
+        // SAFETY: bytes inside our plain allocation.
+        unsafe { cpu_word.write_volatile(0xCAFE_BABE) };
+        copy.copy_back_page(plain);
+        // SAFETY: reading back our plain allocation.
+        let cpu_after = unsafe { cpu_word.read_volatile() };
+        assert_eq!(
+            cpu_after,
+            0xCAFE_BABE,
+            "copy_back_page must not clobber CPU write on untracked page"
+        );
+        assert_eq!(
+            protect_of(plain),
+            PAGE_READWRITE,
+            "copy_back_page must not guard untracked plain memory"
+        );
+
+        // 3) Declared `copy_back` 3-way merges GPU + CPU writes and leaves the
+        //    plain page writable.
+        // SAFETY: bytes inside our plain allocation.
+        unsafe {
+            gpu_word.write_volatile(0x1111_1111);
+            cpu_word.write_volatile(0x2222_2222);
+        }
+        copy.update(pool, len);
+        copy.writing(plain, PAGE, false);
+        // SAFETY: inside the shadow mapping.
+        unsafe { (copy.data.add(PAGE) as *mut u32).write(0xDEAD_BEEF) };
+        // SAFETY: bytes inside our plain allocation.
+        unsafe { cpu_word.write_volatile(0xCAFE_BABE) };
+        copy.copy_back(plain, PAGE);
+        // SAFETY: reading back our plain allocation.
+        unsafe {
+            assert_eq!(gpu_word.read_volatile(), 0xDEAD_BEEF, "GPU write merged");
+            assert_eq!(cpu_word.read_volatile(), 0xCAFE_BABE, "CPU write preserved");
+        }
+        assert_eq!(
+            protect_of(plain),
+            PAGE_READWRITE,
+            "declared copy_back must not guard untracked plain memory"
+        );
+
+        unregister(pool, pool as u64);
     }
 
     /// Runs of the shared buffers start a whole number of elements (and of

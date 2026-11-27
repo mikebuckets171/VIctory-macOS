@@ -20,6 +20,7 @@ pub mod fidelityfx;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
+pub mod gameinput_script;
 pub mod kernel;
 #[cfg(windows)]
 pub mod lifecycle;

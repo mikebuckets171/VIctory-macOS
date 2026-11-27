@@ -389,7 +389,7 @@ nap() {
 # look before it uses the Mac any further.
 cmd_work() {
     accepted || die "the fleet terms are not accepted yet; run tools/fleet/fleet.sh doctor"
-    local chip n held tasks fails=0 done_count=0
+    local chip n held tasks fails=0 done_count=0 last=""
     chip=$(my_chip)
     is_chip "$chip" || die "unknown chip: $(brand)"
     mkdir -p "$CACHE"
@@ -397,8 +397,10 @@ cmd_work() {
     say "working until stopped. To stop after the current task: tools/fleet/fleet.sh stop"
     while [ ! -f "$STOP_FILE" ]; do
         accepted || die "the fleet rules changed; the person must accept them again (fleet.sh rules, then accept)"
+        # The list can still show, for a few seconds, the task whose result
+        # the queue just accepted and closed: skip the one done last.
         held=$(gh issue list -R "$REPO" --state open --assignee @me --label "$(label task)" --label "$(label leased)" \
-            --json number --jq '.[0].number // empty' 2> /dev/null || true)
+            --json number --jq '.[].number' 2> /dev/null | grep -vx "${last:-0}" | head -n 1 || true)
         if [ -n "$held" ]; then
             n=$held
             say "resuming task #$n"
@@ -426,6 +428,7 @@ cmd_work() {
         fi
         if (cmd_run "$n") && (cmd_submit "$n"); then
             fails=0
+            last=$n
             done_count=$((done_count + 1))
             say "task #$n done ($done_count so far)"
             if [ "$(jq -r .setup "$CACHE/logs/$n/result.json" 2> /dev/null)" = failed ]; then
