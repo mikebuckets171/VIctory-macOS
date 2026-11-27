@@ -99,7 +99,7 @@ pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,
-    title_memory_remapped, writing as kernel_will_write,
+    title_memory_remapped, title_memory_unmapping, writing as kernel_will_write,
 };
 
 /// [`shader_cache::under_wine`], asked once: it looks `wine_get_version` up

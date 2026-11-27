@@ -344,11 +344,16 @@ impl PlacedFootprint {
     }
 
     /// The bytes it spans in a buffer: every row pitched but the last.
+    /// `None` when the dimensions overflow u64.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        let lines = u64::from(self.height)
+            .div_ceil(block)
+            .checked_mul(u64::from(self.depth))?;
+        let last = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        u64::from(self.row_pitch)
+            .checked_mul(lines.saturating_sub(1))?
+            .checked_add(last)
     }
 
     /// The byte ranges (from the footprint's start) that a `size` texel
@@ -415,23 +420,27 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         _ => return None,
     };
     let (element, block) = element(format)?;
-    let width = (desc.width >> mip).max(1).next_multiple_of(block);
-    let height = (u64::from(desc.height) >> mip)
+    // Checked: extreme dimensions and mip indices must not wrap or panic,
+    // they give the same unknown-size values as an unreadable description.
+    let width = (desc.width.checked_shr(mip)?)
         .max(1)
-        .next_multiple_of(block);
+        .checked_next_multiple_of(block)?;
+    let height = (u64::from(desc.height).checked_shr(mip)?)
+        .max(1)
+        .checked_next_multiple_of(block)?;
     let depth = if desc.dimension == TEXTURE_3D {
-        (u32::from(desc.depth_or_array_size) >> mip).max(1)
+        u32::from(desc.depth_or_array_size).checked_shr(mip)?.max(1)
     } else {
         1
     };
-    let row_size = width / block * element;
+    let row_size = (width / block).checked_mul(element)?;
     let footprint = PlacedFootprint {
         offset: 0,
         format,
         width: u32::try_from(width).ok()?,
         height: u32::try_from(height).ok()?,
         depth,
-        row_pitch: u32::try_from(row_size.next_multiple_of(pitch_alignment)).ok()?,
+        row_pitch: u32::try_from(row_size.checked_next_multiple_of(pitch_alignment)?).ok()?,
     };
     Some((footprint, u32::try_from(height / block).ok()?, row_size))
 }
@@ -456,14 +465,30 @@ pub(crate) extern "system" fn copyable_footprints(
     let mut end = base;
     let mut known = desc.is_some();
     for i in 0..count {
-        let one = desc.and_then(|d| subresource(d, first + i));
+        let one =
+            desc.and_then(|d| first.checked_add(i).and_then(|index| subresource(d, index)));
         let (layout, row_count, row_size) = match one {
             Some((mut footprint, row_count, row_size)) => {
-                footprint.offset = end.next_multiple_of(PLACEMENT);
-                let pitch = u64::from(footprint.row_pitch);
-                let lines = u64::from(row_count) * u64::from(footprint.depth);
-                end = footprint.offset + pitch * lines.saturating_sub(1) + row_size;
-                (footprint, row_count, row_size)
+                // Checked: extreme dimensions must not wrap or panic, they
+                // give the same unknown-size values as an unreadable one.
+                let placed = end.checked_next_multiple_of(PLACEMENT).and_then(|offset| {
+                    let lines = u64::from(row_count).checked_mul(u64::from(footprint.depth))?;
+                    let span = u64::from(footprint.row_pitch)
+                        .checked_mul(lines.saturating_sub(1))?
+                        .checked_add(row_size)?;
+                    Some((offset, offset.checked_add(span)?))
+                });
+                match placed {
+                    Some((offset, next)) => {
+                        footprint.offset = offset;
+                        end = next;
+                        (footprint, row_count, row_size)
+                    }
+                    None => {
+                        known = false;
+                        (NO_FOOTPRINT, u32::MAX, u64::MAX)
+                    }
+                }
             }
             None => {
                 known = false;
@@ -488,8 +513,9 @@ pub(crate) extern "system" fn copyable_footprints(
         tracing::warn!(?desc, "no footprint for this resource");
     }
     if !total.is_null() {
+        let size = if known { end.checked_sub(base) } else { None };
         // SAFETY: checked non-null.
-        unsafe { total.write(if known { end - base } else { u64::MAX }) };
+        unsafe { total.write(size.unwrap_or(u64::MAX)) };
     }
 }
 
@@ -1691,7 +1717,11 @@ pub(crate) fn evict_unused() {
         let used = used - crate::placement::free_bytes() as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
-    evict(frame, now_ms(), over.max(ram_over()));
+    let ram = ram_over();
+    evict(frame, now_ms(), over.max(ram));
+    // Host copies of title memory take the same memory and textures give
+    // back only part of it: the idle ones go too.
+    crate::shadow::release_idle(frame, ram);
 }
 
 /// Where the card's memory is the computer's own (unified: Apple silicon
@@ -2002,6 +2032,25 @@ fn hand_out_resource(
 static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// A live reference to a title resource, taken under the lookup table's lock
+/// so the title cannot free it while the caller uses it.
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_ref(self.0);
+    }
+}
+
 /// For a texture made for a placed view (`texture_at`): a title texture
 /// the GPU writes (render target, depth or unordered access) at the same
 /// memory, in the same layout and with the same bytes per row and rows
@@ -2011,7 +2060,7 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 /// shortcut: same start only; overlapping ranges, other mips or slices of
 /// one memory, and views of buffers are not matched.
 #[cfg(windows)]
-pub(crate) fn alias_source(placed: This) -> Option<This> {
+pub(crate) fn alias_source(placed: This) -> Option<Held> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
     // A shader view of no resource (a null view) has no memory.
     if placed.is_null() {
@@ -2035,11 +2084,17 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         .peekable();
     written.peek()?;
     let want = bytes(&b.desc)?;
-    written.find(|&r| {
-        let a = resource(r);
-        bytes(&a.desc) == Some(want)
-            && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
-    })
+    // Take a reference under `TEXTURES_AT`'s lock: `Resource::drop` removes
+    // itself under the same lock before freeing the `Resource`, so `try_add_ref`
+    // succeeds only while live and keeps it alive until `Held` drops.
+    written
+        .find(|&r| {
+            let a = resource(r);
+            bytes(&a.desc) == Some(want)
+                && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
+                && crate::object::try_add_ref(r)
+        })
+        .map(Held)
 }
 
 #[cfg(windows)]
@@ -2522,7 +2577,57 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_null_view_has_no_alias_source() {
-        assert_eq!(alias_source(std::ptr::null()), None);
+        assert!(alias_source(std::ptr::null()).is_none());
+    }
+
+    /// An alias source returned by [`alias_source`] holds a reference so the
+    /// title releasing its texture cannot free it before the caller copies
+    /// from it, and dropping the handle releases it cleanly.
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let place = |desc: &ResourceDesc| {
+            let mut out = null;
+            assert_eq!(create_placed(null, h, 0, desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+            out
+        };
+        // Uncompressed 16x16 R32G32B32A32_UINT UAV (format 3, 16 bytes/texel)
+        // and block-compressed 64x64 BC7_UNORM SRV (format 98, 16 bytes/4x4
+        // block) at the same address share row_bytes/rows/swizzle but have
+        // distinct host textures, so `view` resolves `source` as its alias.
+        let source = place(&ResourceDesc { flags: UNORDERED, ..texture(16, 16, 3, 1) });
+        let view = place(&texture(64, 64, 98, 1));
+        let source_host = host_copy(source).expect("source host texture");
+        let view_host = host_copy(view).expect("view host texture");
+        assert!(!std::sync::Arc::ptr_eq(&source_host, &view_host), "distinct host copies");
+        drop((source_host, view_host));
+
+        let held = alias_source(view).expect("an alias source");
+        assert_eq!(held.get(), source);
+
+        // The title releases its reference: `held` still keeps `source` alive.
+        assert_eq!(slot::<Release>(source, 0x10)(source), 1);
+        assert!(host_resource(held.get()).is_some(), "source still live while held");
+        let at = resource(source).data() as u64;
+        assert!(
+            TEXTURES_AT.lock().unwrap().get(&at).is_some_and(|list| list.contains(&(source as usize))),
+            "source still registered while held"
+        );
+
+        // Dropping `held` releases the final reference and unregisters `source`.
+        drop(held);
+        assert!(
+            !TEXTURES_AT.lock().unwrap().get(&at).is_some_and(|list| list.contains(&(source as usize))),
+            "source unregistered after handle drops"
+        );
+
+        assert_eq!(slot::<Release>(view, 0x10)(view), 0);
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 
     #[test]
@@ -2995,6 +3100,160 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    #[test]
+    fn footprint_bytes_do_not_overflow() {
+        // Ordinary footprints still add up: 100x60 RGBA8, 512-byte pitch.
+        assert_eq!(
+            PlacedFootprint::new(0, 28, 100, 60, 512).bytes(),
+            Some(512 * 59 + 400)
+        );
+        // Extreme type-valid dimensions overflow u64: `None`, no panic.
+        let huge = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: u32::MAX,
+            height: u32::MAX,
+            depth: u32::MAX,
+            row_pitch: u32::MAX,
+        };
+        assert_eq!(huge.bytes(), None);
+    }
+
+    #[test]
+    fn copyable_footprints_do_not_overflow() {
+        let null = std::ptr::null();
+        const POISON: PlacedFootprint = PlacedFootprint {
+            offset: 0xDEAD_BEEF,
+            format: 0xDEAD_BEEF,
+            width: 0xDEAD_BEEF,
+            height: 0xDEAD_BEEF,
+            depth: 0xDEAD_BEEF,
+            row_pitch: 0xDEAD_BEEF,
+        };
+        let footprints = |desc: &ResourceDesc, base: u64| {
+            let mut layouts = [POISON; 1];
+            let (mut rows, mut sizes, mut total) = ([123; 1], [456; 1], 789);
+            copyable_footprints(
+                null,
+                desc,
+                0,
+                1,
+                base,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            (layouts[0], rows[0], sizes[0], total)
+        };
+        // RGBA8 3D texture with extreme type-valid dimensions: the pitched
+        // rows alone exceed u64, so the unknown-size values come back.
+        let desc = ResourceDesc {
+            dimension: TEXTURE_3D,
+            depth_or_array_size: u16::MAX,
+            ..texture(1 << 28, u32::MAX, 28, 1)
+        };
+        assert_eq!(
+            footprints(&desc, 0),
+            (NO_FOOTPRINT, u32::MAX, u64::MAX, u64::MAX)
+        );
+        // A base near u64::MAX: 512-byte alignment overflows (it must not
+        // wrap the offset to 0) and an aligned offset plus the span does too.
+        let small = texture(4, 4, 28, 1);
+        for base in [u64::MAX, u64::MAX - 512, u64::MAX - 511] {
+            assert_eq!(
+                footprints(&small, base),
+                (NO_FOOTPRINT, u32::MAX, u64::MAX, u64::MAX),
+                "base {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn copyable_footprints_survive_extreme_subresources() {
+        let null = std::ptr::null();
+        // Poisoned outputs: every slot must be written, so seed them with
+        // values no result can be confused with.
+        const POISON: PlacedFootprint = PlacedFootprint {
+            offset: 0xDEAD_BEEF,
+            format: 0xDEAD_BEEF,
+            width: 0xDEAD_BEEF,
+            height: 0xDEAD_BEEF,
+            depth: 0xDEAD_BEEF,
+            row_pitch: 0xDEAD_BEEF,
+        };
+        let run = |desc: &ResourceDesc, first: u32, count: u32| {
+            let mut layouts = [POISON; 2];
+            let mut rows = [0xAAAA_AAAA; 2];
+            let mut sizes = [0xAAAA_AAAA_AAAA_AAAA; 2];
+            let mut total = 0xAAAA_AAAA_AAAA_AAAA;
+            copyable_footprints(
+                null,
+                desc,
+                first,
+                count,
+                0,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+            (layouts, rows, sizes, total)
+        };
+        let sentinel = (NO_FOOTPRINT, u32::MAX, u64::MAX, u64::MAX);
+        // BC1 with width u64::MAX: the block alignment overflows u64.
+        let (l, r, s, t) = run(&texture(u64::MAX, 1, 71, 1), 0, 1);
+        assert_eq!((l[0], r[0], s[0], t), sentinel);
+        // RGBA8 with width 1 << 62: the row size (width * 4) overflows u64.
+        let (l, r, s, t) = run(&texture(1 << 62, 1, 28, 1), 0, 1);
+        assert_eq!((l[0], r[0], s[0], t), sentinel);
+        // A mip index too big to shift the width by (64)...
+        let (l, r, s, t) = run(&texture(64, 64, 28, 65), 64, 1);
+        assert_eq!((l[0], r[0], s[0], t), sentinel);
+        // ...or a 3D depth by (32).
+        let depth3d = ResourceDesc {
+            dimension: TEXTURE_3D,
+            depth_or_array_size: 8,
+            ..texture(64, 64, 28, 33)
+        };
+        let (l, r, s, t) = run(&depth3d, 32, 1);
+        assert_eq!((l[0], r[0], s[0], t), sentinel);
+        // first = u32::MAX with count = 2: first + 1 overflows u32.
+        let (l, r, s, t) = run(&texture(64, 64, 28, 1), u32::MAX, 2);
+        assert_eq!(
+            (l, r, s, t),
+            ([NO_FOOTPRINT; 2], [u32::MAX; 2], [u64::MAX; 2], u64::MAX)
+        );
+        // Multi-subresource: an overflowing mip followed by a valid one.
+        let array2 =
+            ResourceDesc { depth_or_array_size: 2, ..texture(64, 64, 28, 65) };
+        let (l, r, s, t) = run(&array2, 64, 2);
+        let full = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 64,
+            height: 64,
+            depth: 1,
+            row_pitch: 256,
+        };
+        assert_eq!((l[0], r[0], s[0]), (NO_FOOTPRINT, u32::MAX, u64::MAX));
+        assert_eq!((l[1], r[1], s[1]), (full, 64, 256));
+        assert_eq!(t, u64::MAX);
+        // A valid mip followed by an overflowing one.
+        let (l, r, s, t) = run(&texture(64, 64, 28, 65), 63, 2);
+        let tiny = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 1,
+            height: 1,
+            depth: 1,
+            row_pitch: 256,
+        };
+        assert_eq!((l[0], r[0], s[0]), (tiny, 1, 4));
+        assert_eq!((l[1], r[1], s[1]), (NO_FOOTPRINT, u32::MAX, u64::MAX));
+        assert_eq!(t, u64::MAX);
     }
 
     #[test]

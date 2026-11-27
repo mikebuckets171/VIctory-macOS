@@ -290,9 +290,11 @@ impl Lower<'_> {
     ) -> Result<V, Why> {
         use super::super::wave::Op;
         let c = self.cur;
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        // AddH's half results are accumulated in f32, then rounded to f16 by
+        // the caller, just like the single-wave lowering.
+        let float = matches!(op, Op::AddF | Op::AddH | Op::MinF | Op::MaxF);
         let bits = if float { self.as_int(total) } else { total };
-        let missing = self.s.m.i32(ident);
+        let missing = self.s.m.i32(if op == Op::AddH { 0 } else { ident });
         let (lo, hi) = self.exchange_halves(bits, missing, c)?;
         let (lo, hi) = if float {
             (self.as_float(lo), self.as_float(hi))
@@ -311,7 +313,7 @@ impl Lower<'_> {
             l.s.m.select(c, less, lo, hi)
         };
         Ok(match op {
-            Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
+            Op::AddU | Op::AddF | Op::AddH => self.s.m.bin(c, Bin::Add, lo, hi),
             Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
             Op::And => self.s.m.bin(c, Bin::And, lo, hi),
             Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
@@ -322,7 +324,6 @@ impl Lower<'_> {
             // FMin, FMax: as the host's own wave minimum and maximum.
             Op::MinF => self.binary(36, lo, hi),
             Op::MaxF => self.binary(35, lo, hi),
-            Op::AddH => return Err("a 16-bit wave reduction over both 32-lane halves"),
         })
     }
 }

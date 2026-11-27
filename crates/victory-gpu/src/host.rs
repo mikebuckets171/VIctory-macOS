@@ -4301,6 +4301,19 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
+            // How long the threads that ran held work were held by it: a
+            // title thread waits there instead of going on with its frame.
+            let ms = |us: u64| us as f64 / 1e3 / report_frames;
+            let held: Vec<String> = crate::queue::WHY_NAMES
+                .iter()
+                .zip(crate::queue::take_blocked())
+                .map(|(why, [lock, run])| format!("{why} {:.1} + {:.1}", ms(lock), ms(run)))
+                .collect();
+            tracing::info!(
+                "threads held by host GPU work per frame, ms waiting for the queues' lock + \
+                 running it: {}",
+                held.join(", ")
+            );
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {

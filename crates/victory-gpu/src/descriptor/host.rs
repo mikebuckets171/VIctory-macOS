@@ -18,7 +18,12 @@ use crate::host::host;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
 
+/// Monotonic identity for each [`HostHeap`] so stale dynamic-slot releases
+/// targeting a released heap's recycled address never free a newer heap's slots.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -226,6 +231,7 @@ impl HostHeap {
             sampler,
         ));
         let mut h = HostHeap {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -442,7 +448,7 @@ impl HostHeap {
         if index >= self.count + self.dynamic {
             self.pairs.lock().unwrap_or_else(|e| e.into_inner()).1.push(index);
         } else {
-            self.release(index, 2);
+            self.release(self.id, index, 2);
         }
     }
 
@@ -452,11 +458,20 @@ impl HostHeap {
         self.count
     }
 
+    /// This heap's unique identity ([`NEXT_ID`]): dynamic slots are returned
+    /// only when the caller's identity matches this heap.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), only if `id` matches this heap's [`Self::id`].
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(crate) fn release(&self, id: u64, first: u32, n: u32) {
+        if id != self.id {
+            return;
+        }
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
@@ -2738,7 +2753,7 @@ mod tests {
         assert_eq!(heap.address_at(end - 1), Some(address));
         // A slot given back keeps its entry until it is made again; made
         // null, it has its entry cleared.
-        heap.release(first, 2);
+        heap.release(heap.id(), first, 2);
         assert_eq!(
             heap.address_at(first),
             Some(address),
@@ -2846,7 +2861,7 @@ mod tests {
         assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.release(heap.id(), a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
@@ -2864,18 +2879,43 @@ mod tests {
         assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
+        heap.release(heap.id(), left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        heap.release(heap.id(), left, 2);
+        heap.release(heap.id(), right, 2);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
         // A free slot at each physical end does not form a two-slot range.
-        heap.release(first, 1);
+        heap.release(heap.id(), first, 1);
         let last = first + heap.dynamic - 1;
-        heap.release(last, 1);
+        heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// A range of dynamic slots is returned only to the heap that allocated it:
+    /// a stale release carrying another heap's identity must be a no-op.
+    #[test]
+    fn dynamic_slots_are_given_back_only_to_the_heap_that_took_them() {
+        let Some(a) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(b) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_ne!(a.id(), b.id());
+        let first = a.dynamic(2).expect("two dynamic slots");
+        let rest = a.dynamic(a.dynamic - 2).expect("remaining dynamic slots");
+        assert_eq!(rest, first + 2);
+        assert_eq!(a.dynamic(1), None, "heap is full");
+
+        // Releasing with another heap's identity must not free A's slots.
+        a.release(b.id(), first, 2);
+        assert_eq!(a.dynamic(1), None, "foreign heap id must not free A's slots");
+
+        // Releasing with A's own identity gives the range back.
+        a.release(a.id(), first, 2);
+        assert_eq!(a.dynamic(2), Some(first), "own heap id returns the range");
     }
 
     /// A texture view's size words are the console image descriptor's

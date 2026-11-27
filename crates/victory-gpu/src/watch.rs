@@ -1017,6 +1017,10 @@ pub struct Writing {
 
 impl Drop for Writing {
     fn drop(&mut self) {
+        // An unmapping with tracking off: nothing was noted.
+        if self.first == self.last {
+            return;
+        }
         let mut g = guards();
         if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
             g.busy.swap_remove(i);
@@ -1044,9 +1048,55 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    remapped(&mut guards(), first, last);
+}
+
+/// Before title memory `[at, at + len)` is unmapped or freed (`len` 0: the
+/// whole allocation at `at`, as `VirtualFree` with `MEM_RELEASE` frees):
+/// as [`title_memory_remapped`], and its pages stay unguarded until the
+/// result is dropped, after the memory went.
+///
+/// A page guarded while it goes stays in the guard set after it went.
+/// Memory allocated at that address later (the title's pools are freed
+/// and allocated again; nothing tells the guards of an allocation) then
+/// counts as guarded already and is never made read-only: its writes go
+/// unseen, and copies of it keep stale bytes. So the runtime calls this
+/// around its unmappings and the title's frees, and a tracker taking the
+/// pages meanwhile leaves them changed, as during a kernel write.
+pub fn title_memory_unmapping(at: usize, len: usize) -> Writing {
+    if !fault_tracking() || at == 0 {
+        return Writing { first: 0, last: 0 };
+    }
+    let len = if len == 0 { allocation_len(at) } else { len };
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
+    g.busy.push((first, last));
+    remapped(&mut g, first, last);
+    Writing { first, last }
+}
+
+/// The bytes of the allocation that starts at `at`: its regions while they
+/// share that allocation base (guarded and open pages are regions of their
+/// own). 0 if nothing is allocated there.
+fn allocation_len(at: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut len = 0usize;
+    loop {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((at + len) as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.AllocationBase as usize != at || info.RegionSize == 0 {
+            return len;
+        }
+        len += info.RegionSize;
+    }
+}
+
+/// [`title_memory_remapped`] of pages `[first, last)`, under the guard lock.
+fn remapped(g: &mut Guards, first: usize, last: usize) {
     // What it showed is gone already: nothing to keep.
-    changed(&mut g, first, last, false);
+    changed(g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -1969,6 +2019,60 @@ pub(crate) mod tests {
             "aliasing a busy page marks the tracked one"
         );
         drop(busy_c);
+    }
+
+    /// Memory given up while a tracker holds it guarded (a pool page
+    /// decommitted here; the title frees and allocates its pools again,
+    /// which no one tells the guards of) is guarded when it comes back: the
+    /// guard goes with it, and a take while it goes leaves it unguarded. A
+    /// guard set that still named the page would skip it as guarded already,
+    /// and the new memory's writes would go unseen.
+    #[test]
+    fn memory_given_up_under_a_guard_is_guarded_when_it_comes_back() {
+        use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+        let p = pool(2);
+        let page = p + PAGE;
+        let t = track(p, 2 * PAGE, true).expect("pool memory is tracked");
+        assert_eq!(t.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+        assert!(read_only(page));
+        let going = title_memory_unmapping(page, PAGE);
+        assert!(writable(page), "given up: no guard while it goes");
+        assert_eq!(
+            t.take(p, p + 2 * PAGE),
+            [(page, p + 2 * PAGE)],
+            "changed, and taken"
+        );
+        assert!(writable(page), "a take while it goes guards nothing");
+        // SAFETY: the second page of our pool; the reservation stays.
+        let freed = unsafe { VirtualFree(page as *mut _, PAGE, MEM_DECOMMIT) };
+        assert_ne!(freed, 0);
+        drop(going);
+        // SAFETY: the same page of our reservation, committed again.
+        let back =
+            unsafe { VirtualAlloc(page as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_eq!(back, page);
+        assert_eq!(t.take(p, p + 2 * PAGE), [(page, p + 2 * PAGE)]);
+        assert!(read_only(page), "the memory that came back is guarded");
+        // SAFETY: a byte of the page, guarded: the handler opens it.
+        unsafe { ((page + 8) as *mut u8).write_volatile(1) };
+        assert!(t.changed(page / PAGE), "and its writes are seen");
+        drop(t);
+        free(p);
+    }
+
+    /// With length 0, the whole allocation at the address goes (as
+    /// `VirtualFree` with `MEM_RELEASE` frees it).
+    #[test]
+    fn unmapping_with_no_length_takes_the_whole_allocation() {
+        let p = pool(3);
+        let t = track(p, 3 * PAGE, true).expect("pool memory is tracked");
+        assert_eq!(t.take(p, p + 3 * PAGE), [(p, p + 3 * PAGE)]);
+        let going = title_memory_unmapping(p, 0);
+        assert!((0..3).all(|k| writable(p + k * PAGE)));
+        assert_eq!(t.take(p, p + 3 * PAGE), [(p, p + 3 * PAGE)]);
+        drop(going);
+        drop(t);
+        free(p);
     }
 
     /// A write or mapping that runs past the end of the address space (a

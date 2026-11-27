@@ -531,6 +531,7 @@ mod tests {
 
     struct AliasedAlloc {
         ptr: *mut u8,
+        len: usize,
         aliased: bool,
     }
 
@@ -552,7 +553,7 @@ mod tests {
             }
             let aliased = alias_region(ptr as usize, len, preserve);
             assert!(aliased, "alias_region failed");
-            Self { ptr, aliased }
+            Self { ptr, len, aliased }
         }
     }
 
@@ -561,6 +562,14 @@ mod tests {
             if self.aliased {
                 unalias_region(self.ptr as usize);
             }
+            // As the runtime does when the title unmaps memory: the guards
+            // let go of its pages. A tracker some test or copy still holds
+            // left them in the guard set otherwise, and a test running at
+            // the same time that was given the address had them skipped as
+            // guarded already, so they stayed writable (#31:
+            // `takes_guard_one_view_per_call` after
+            // `aliased_gpu_writes_notify_overlapping_texture_tracker`).
+            crate::watch::title_memory_remapped(self.ptr as usize, self.len);
             // SAFETY: `self.ptr` was allocated by `VirtualAlloc`.
             unsafe { VirtualFree(self.ptr.cast(), 0, MEM_RELEASE) };
         }
@@ -769,7 +778,11 @@ mod tests {
         .cast::<u8>();
         assert!(!ptr.is_null());
         assert!(alias_region(ptr as usize, len, false));
-        let alloc = AliasedAlloc { ptr, aliased: true };
+        let alloc = AliasedAlloc {
+            ptr,
+            len,
+            aliased: true,
+        };
         let shadow = crate::shadow::find(alloc.ptr as u64, len as u64).expect("aliased shadow");
         let base = alloc.ptr as usize;
 

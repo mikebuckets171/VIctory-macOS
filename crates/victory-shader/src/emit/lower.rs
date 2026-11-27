@@ -120,6 +120,10 @@ pub(crate) struct Lowered {
     /// title-memory page table, one entry per load.
     #[cfg(test)]
     pub raw_loads: [Vec<usize>; 2],
+    /// The written `dx.op.unary.f32` calls: their DXIL opcodes, and whether
+    /// the operand was denormal-flushed first. For structural tests.
+    #[cfg(test)]
+    pub unary_f32: Vec<(u32, bool)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1344,11 +1348,14 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
-            Shape::Half(..) if self.halves => return Err(ACROSS),
             Shape::Half(_, src, mask, ident, hi) => {
                 // The high half is a console lane's: compute only.
                 if self.mask_data != MaskData::Console {
                     return Err("a 16-bit wave reduction outside compute");
+                }
+                let across = self.halves && !self.one_host_wave();
+                if across && !self.across_here() {
+                    return Err(ACROSS);
                 }
                 let c = self.cur;
                 let &m = self
@@ -1376,22 +1383,40 @@ impl<'a> Lower<'a> {
                     119,
                     &[f, sum, signed],
                 );
+                // In halves, each host wave reduced its own 32 lanes. Pass
+                // those f32 totals between the halves before rounding once.
+                let r = if across {
+                    self.reduce_across(Op::AddH, r, r, false, ident)?
+                } else {
+                    r
+                };
                 let r = self.f32_to_f16(c, r);
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
                 // elsewhere on the host; there it holds the identity.
                 let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let b = self
-                    .s
-                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-                let word = self.s.m.extract(c, b, hi / 32);
+                let word = if across {
+                    // Lane `hi` may be in the other host wave: both halves'
+                    // ballots, as its value is read across them below.
+                    let (lo, up) = self.ballot_across_halves(on, c)?;
+                    if hi < 32 { lo } else { up }
+                } else {
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let b = self
+                        .s
+                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+                    self.s.m.extract(c, b, hi / 32)
+                };
                 let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
                 let bit = self.s.m.bin(c, Bin::LShr, word, sh);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 let there = self.s.m.cmp(c, pred::NE, bit, z);
                 let lane = self.s.m.i32(hi);
-                let at = self.read_lane(x, lane);
+                let at = if across {
+                    self.read_lane_across(x, lane)?
+                } else {
+                    self.read_lane(x, lane)
+                };
                 let top = self.s.m.select(c, there, at, id);
                 let high = self.s.m.i32(0xFFFF_0000);
                 let top = self.s.m.bin(c, Bin::And, top, high);
@@ -1700,6 +1725,8 @@ impl<'a> Lower<'a> {
             early_depth_stencil: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
             #[cfg(test)]
             raw_loads,
+            #[cfg(test)]
+            unary_f32: self.s.m.written_unary_f32_flushes(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6962,7 +6989,20 @@ impl<'a> Lower<'a> {
                 };
                 let r = match op {
                     12 | 13 => self.trig_turns(a, op == 12),
-                    22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
+                    // The console reads f32 denormals as zeros of their sign.
+                    // DXIL floor/ceil/fract need not do that (vkd3d on NVIDIA
+                    // keeps them: no FP32 denorm flush capability), so flush
+                    // on the bits first, as for max/min and the floor
+                    // conversions. trunc and rndne already round subnormals
+                    // to signed zero.
+                    22 => {
+                        let flushed = self.ftz(a);
+                        self.fract(flushed, 1.0, f32::from_bits(0x3F7F_FFFF))
+                    }
+                    27 | 28 => {
+                        let flushed = self.ftz(a);
+                        self.unary(op, flushed)
+                    }
                     _ => self.unary(op, a),
                 };
                 float(self, r)

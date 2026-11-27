@@ -78,9 +78,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap, host heap identity
+    /// (`HostHeap::id`), first, count; given back when the list is reset or
+    /// released.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -112,10 +113,10 @@ struct Fixed {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        for &(heap, id, first, n) in &self.dynamic {
             match (heap, crate::memory::heap()) {
-                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
+                (MEMORY_HEAP, Some(ours)) => ours.release(id, first, n),
+                _ => crate::descriptor::release_dynamic(heap, id, first, n),
             }
         }
     }
@@ -1035,7 +1036,7 @@ impl State {
                 not_run("no dynamic slots for root views");
                 return None;
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
+            self.dynamic.push((key, host.id(), first, ROOT_VIEW_RUN));
             self.root_run = (key, first, first + ROOT_VIEW_RUN);
         }
         let index = self.root_run.1;
@@ -1126,7 +1127,7 @@ impl State {
             return;
         };
         self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+            .push((std::ptr::from_ref(heap) as usize, visible.id(), slot, 1));
         visible.make_at(slot, &view);
         let at = host.cpu_view();
         let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
@@ -1408,7 +1409,7 @@ impl State {
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1996,7 +1997,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
             // A view of memory the GPU writes through another title texture
             // whose host copy this one could not share reads that copy.
             if let Some(a) = crate::resource::alias_source(*resource as This) {
-                crate::texture::alias_copy(list, a, *resource as This);
+                crate::texture::alias_copy(list, a.get(), *resource as This);
             }
             if let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.title_written()
@@ -3769,7 +3770,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
 
         slots.make_null(dynamic);
-        slots.release(dynamic, 1);
+        slots.release(slots.id(), dynamic, 1);
         drop(list);
         assert_eq!(
             crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(heap, 0x10)(heap),

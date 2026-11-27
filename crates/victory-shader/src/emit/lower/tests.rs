@@ -224,6 +224,30 @@ fn vop3_conversion_modifiers_affect_the_lowering() {
     }
 }
 
+/// The f32 rounding ops that read a denormal operand as a zero of its sign
+/// (`v_fract_f32`, `v_floor_f32`, `v_ceil_f32`) flush it on the bits before
+/// the DXIL unary op; `v_trunc_f32` and `v_rndne_f32` already round
+/// subnormals to signed zero, so they take the operand as is.
+#[test]
+fn fract_floor_and_ceil_flush_denormal_operands() {
+    // VOP1 `v_<op>_f32 v0, v1`, its DXIL unary opcode, and whether the
+    // operand is flushed first.
+    for (op, unary, flushed) in [
+        (0x20u32, 22, true), // v_fract_f32
+        (0x24, 27, true),    // v_floor_f32
+        (0x22, 28, true),    // v_ceil_f32
+        (0x23, 26, false),   // v_rndne_f32
+        (0x21, 29, false),   // v_trunc_f32
+    ] {
+        let l = lower_valu(&[0x7E00_0000 | op << 9 | 0x101]).unwrap();
+        assert_eq!(
+            l.unary_f32,
+            [(unary, flushed)],
+            "VOP1 {op:#04x} lowers to DXIL unary {unary}"
+        );
+    }
+}
+
 #[test]
 fn the_24_bit_multiplies_lower_both_halves() {
     // VOP2 `op v0, v1, v2`: v_mul_i32_i24 and v_mul_u32_u24 (the low
