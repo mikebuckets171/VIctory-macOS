@@ -975,8 +975,14 @@ mod view_space {
         unsafe impl Send for Tools {}
         static TOOLS: Mutex<Option<Tools>> = Mutex::new(None);
 
+        /// Off unless `VICTORY_TILE_CHECK=1`: the check's copy runs on the
+        /// host queue right before a submission (run zc1: with it on from
+        /// the first submission, that submission never finished).
         pub(super) fn due() -> bool {
-            tiles_on() && CALLS.fetch_add(1, Relaxed) % EVERY == 0
+            static ON: OnceLock<bool> = OnceLock::new();
+            *ON.get_or_init(|| crate::switch::on("VICTORY_TILE_CHECK"))
+                && tiles_on()
+                && CALLS.fetch_add(1, Relaxed) % EVERY == 0
         }
 
         pub(super) fn summary() -> String {
