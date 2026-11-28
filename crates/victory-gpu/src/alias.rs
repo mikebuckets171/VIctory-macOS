@@ -775,8 +775,69 @@ mod view_space {
             }
         }
         UPDATES.fetch_add(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        probe_updates(queue, &pending);
         if !to_check.is_empty() {
             check::run(queue, &to_check);
+        }
+    }
+
+    /// Diagnostics (`VICTORY_TILE_PROBE=1`): after a batch of tile updates,
+    /// waits for the queue to pass them (a fence of our own) and logs the
+    /// batch and how long that took, for the first batches and any slow
+    /// one: whether the updates themselves stall the queue (run zc2: the
+    /// first submission after them never finished).
+    fn probe_updates(queue: &ID3D12CommandQueue, pending: &[(ID3D12Resource, Pending)]) {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| crate::switch::on("VICTORY_TILE_PROBE")) || pending.is_empty() {
+            return;
+        }
+        static BATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static FENCE: Mutex<Option<(usize, u64)>> = Mutex::new(None);
+        let batch = BATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tiles: u64 = pending.iter().map(|(_, p)| u64::from(p.count)).sum();
+        let unmaps = pending.iter().filter(|(_, p)| p.heap.is_none()).count();
+        let largest = pending.iter().map(|(_, p)| p.count).max().unwrap_or(0);
+        let Some(h) = host() else { return };
+        let mut guard = FENCE.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            // SAFETY: plain creation; the fence is kept for the process.
+            let Ok(fence) = (unsafe { h.device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) })
+            else {
+                return;
+            };
+            *guard = Some((fence.into_raw() as usize, 0));
+        }
+        let Some((raw, value)) = guard.as_mut() else { return };
+        // SAFETY: the fence made above, never released.
+        let fence = unsafe { std::mem::ManuallyDrop::new(ID3D12Fence::from_raw(*raw as *mut _)) };
+        *value += 1;
+        let started = std::time::Instant::now();
+        // SAFETY: a plain signal on the host queue.
+        if unsafe { queue.Signal(&*fence, *value) }.is_err() {
+            return;
+        }
+        let passed = loop {
+            // SAFETY: a plain query.
+            if unsafe { fence.GetCompletedValue() } >= *value {
+                break true;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(20) {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        };
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        if batch < 40 || !passed || ms > 50.0 {
+            tracing::info!(
+                batch,
+                updates = pending.len(),
+                tiles,
+                unmaps,
+                largest,
+                passed,
+                ms = format_args!("{ms:.1}"),
+                "tile updates: the queue passed them"
+            );
         }
     }
 
