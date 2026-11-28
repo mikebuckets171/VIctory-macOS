@@ -823,6 +823,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             );
             written += 1;
         }
+        #[cfg(feature = "diagnostics")]
+        for &at in &missed {
+            crate::alias::note_missed(at);
+        }
         if written > 0 || withheld > 0 || pages > 0 || regions > 0 {
             stats(|s| {
                 s.written += written;

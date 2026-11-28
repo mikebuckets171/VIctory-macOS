@@ -1433,8 +1433,11 @@ fn finish_map(
     // space follow, so it reads and writes them there with no host copy
     // (`victory_gpu::view_space_map`).
     #[cfg(feature = "diagnostics")]
-    if let Some(shared) = &slice.section.shared {
-        victory_gpu::view_space_map(base, len, shared, slice.index * PAGE);
+    match &slice.section.shared {
+        Some(shared) => {
+            victory_gpu::view_space_map(base, len, shared, slice.index * PAGE);
+        }
+        None => victory_gpu::view_space_unshared(base, len),
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
@@ -1587,6 +1590,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         #[cfg(feature = "diagnostics")]
         if slice.section.shared.is_some() {
             victory_gpu::view_space_unmap(at, size);
+        } else {
+            victory_gpu::view_space_unshared_gone(at);
         }
         // SAFETY: a view we mapped; it becomes a placeholder again.
         let gone = unsafe {

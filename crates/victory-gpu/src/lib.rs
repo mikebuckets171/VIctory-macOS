@@ -121,7 +121,10 @@ pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use alias::{view_space_counts, view_space_map, view_space_reserve, view_space_unmap};
+pub use alias::{
+    view_space_counts, view_space_map, view_space_reserve, view_space_unmap, view_space_unshared,
+    view_space_unshared_gone,
+};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]

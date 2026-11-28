@@ -473,6 +473,9 @@ mod view_space {
         pub(crate) reserved: ID3D12Resource,
         /// The heaps its tiles were ever pointed at, kept alive with it.
         heaps: Vec<ID3D12Heap>,
+        /// The tiles a view shows once the pending updates are made, a bit
+        /// each (diagnostics: `describe`, `check`).
+        shown: Vec<u64>,
     }
 
     /// A tile mapping to make before the next submission: `count` tiles of
@@ -492,6 +495,11 @@ mod view_space {
         /// Chunks by their first title address.
         pub(crate) chunks: BTreeMap<usize, Chunk>,
         pending: Vec<Pending>,
+        /// Diagnostics: views in a reservation that no tile follows, by
+        /// address (their length): of a section with no shared heap, and
+        /// those mapped while no chunk could be had.
+        unshared: BTreeMap<usize, usize>,
+        unqueued: BTreeMap<usize, usize>,
     }
 
     pub(crate) static SPACES: Mutex<Option<Spaces>> = Mutex::new(None);
@@ -587,6 +595,7 @@ mod view_space {
                 slot.insert(Chunk {
                     reserved,
                     heaps: Vec::new(),
+                    shown: vec![0; CHUNK / PAGE / 64],
                 });
             }
             self.chunks.get_mut(&first)
@@ -610,6 +619,8 @@ mod view_space {
                     Some((heap, offset)) => {
                         let Some(chunk) = self.chunk(first, chunk_len) else {
                             ok = false;
+                            self.unqueued.insert(a, b - a);
+                            UNQUEUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             a = b;
                             continue;
                         };
@@ -625,6 +636,19 @@ mod view_space {
                     }
                     None => None,
                 };
+                if let Some(chunk) = self.chunks.get_mut(&first) {
+                    for tile in first_tile..first_tile + tiles {
+                        let (word, bit) = ((tile / 64) as usize, 1u64 << (tile % 64));
+                        if mapped.is_some() {
+                            chunk.shown[word] |= bit;
+                        } else {
+                            chunk.shown[word] &= !bit;
+                        }
+                    }
+                }
+                if mapped.is_none() {
+                    self.unqueued.remove(&a);
+                }
                 self.pending.push(Pending {
                     chunk: first,
                     first: first_tile,
@@ -691,19 +715,23 @@ mod view_space {
     /// the next submission (every earlier one has finished: the host waits
     /// for each, so no list in flight reads through the old mappings).
     pub(crate) fn apply_view_space(queue: &ID3D12CommandQueue) {
-        let pending = {
+        let (pending, to_check) = {
             let mut guard = spaces();
             let Some(spaces) = guard.as_mut() else {
                 return;
             };
-            if spaces.pending.is_empty() {
+            // Chosen under the lock that takes the pending updates: these
+            // tiles are shown once the updates below are made.
+            let to_check = check::due().then(|| check::pick(spaces)).unwrap_or_default();
+            if spaces.pending.is_empty() && to_check.is_empty() {
                 return;
             }
             let pending = std::mem::take(&mut spaces.pending);
-            pending
+            let pending = pending
                 .into_iter()
                 .filter_map(|p| spaces.chunks.get(&p.chunk).map(|c| (c.reserved.clone(), p)))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (pending, to_check)
         };
         for (reserved, p) in &pending {
             let start = D3D12_TILED_RESOURCE_COORDINATE {
@@ -747,6 +775,382 @@ mod view_space {
             }
         }
         UPDATES.fetch_add(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if !to_check.is_empty() {
+            check::run(queue, &to_check);
+        }
+    }
+
+    /// Diagnostics counters: views of sections with no shared heap mapped
+    /// in a reservation, and views mapped while no chunk could be had.
+    static UNSHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static UNQUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Whether the placeholder space is given to the GPU through tiles
+    /// (`VICTORY_PHYSICAL_TILES`).
+    fn tiles_on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_PHYSICAL_TILES"))
+    }
+
+    /// Diagnostics: the view at `[at, at + len)` shows pages of a section
+    /// with no shared heap. In a placeholder reservation no tile can follow
+    /// it: if its chunk exists (now or later), the GPU reads zeros there.
+    pub fn view_space_unshared(at: usize, len: usize) {
+        if !tiles_on() {
+            return;
+        }
+        let mut guard = spaces();
+        let Some(spaces) = guard.as_mut() else {
+            return;
+        };
+        if spaces.reservation(at, len).is_none() {
+            return;
+        }
+        spaces.unshared.insert(at, len);
+        if UNSHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            tracing::warn!(
+                at = format_args!("{at:#x}"),
+                len,
+                "a view of a section with no shared heap in placeholder space: no tile shows it"
+            );
+        }
+    }
+
+    /// Diagnostics: the view [`view_space_unshared`] noted at `at` goes.
+    pub fn view_space_unshared_gone(at: usize) {
+        if !tiles_on() {
+            return;
+        }
+        if let Some(spaces) = spaces().as_mut() {
+            spaces.unshared.remove(&at);
+        }
+    }
+
+    /// Diagnostics: what the GPU side has at title address `at`.
+    pub(crate) fn describe(at: usize) -> &'static str {
+        let guard = spaces();
+        let Some(spaces) = guard.as_ref() else {
+            return "outside placeholder space";
+        };
+        let Some((base, len)) = spaces.reservation(at, 1) else {
+            return "outside placeholder space";
+        };
+        let holds = |views: &BTreeMap<usize, usize>| {
+            views.range(..=at).next_back().is_some_and(|(&a, &l)| at < a + l)
+        };
+        if holds(&spaces.unshared) {
+            return "placeholder space: a view of a section with no shared heap";
+        }
+        let (first, _) = chunk_of(base, len, at);
+        let Some(chunk) = spaces.chunks.get(&first) else {
+            return if holds(&spaces.unqueued) {
+                "placeholder space: no chunk, a view no tile took"
+            } else {
+                "placeholder space: no chunk"
+            };
+        };
+        if holds(&spaces.unqueued) {
+            return "placeholder space: a view mapped before its chunk was made";
+        }
+        let tile = (at - first) / PAGE;
+        if chunk.shown[tile / 64] >> (tile % 64) & 1 != 0 {
+            "placeholder space: tile shown"
+        } else {
+            "placeholder space: tile not shown"
+        }
+    }
+
+    /// Diagnostics: title memory shaders asked for and no copy held, by
+    /// what is there, since the last [`log_view_space`].
+    static MISSED: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
+
+    /// Diagnostics: shaders read or wrote title memory at `at` and the
+    /// page table named no copy for it.
+    pub(crate) fn note_missed(at: u64) {
+        if !tiles_on() {
+            return;
+        }
+        let mut class = describe(at as usize);
+        if class == "outside placeholder space" {
+            class = if crate::shadow::has_aliased_overlap(at, at + 1) {
+                "an aliased private region"
+            } else {
+                use windows_sys::Win32::System::Memory::{
+                    MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION,
+                    VirtualQuery,
+                };
+                // SAFETY: a query of an address, answered into a local.
+                let info = unsafe {
+                    let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                    VirtualQuery(at as usize as *const _, &mut info, size_of_val(&info));
+                    info
+                };
+                if info.State == MEM_FREE || info.State == 0 {
+                    "a free address"
+                } else if info.State != MEM_COMMIT {
+                    "reserved, not committed"
+                } else if info.Type == MEM_IMAGE {
+                    "committed: an image"
+                } else if info.Type == MEM_MAPPED {
+                    "committed: a mapped view outside placeholder space"
+                } else {
+                    "committed: private memory"
+                }
+            };
+        }
+        let mut missed = MISSED.lock().unwrap_or_else(|e| e.into_inner());
+        *missed.entry(class).or_insert(0) += 1;
+        drop(missed);
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 96 {
+            tracing::info!(at = format_args!("{at:#x}"), class, "title memory missed");
+        }
+    }
+
+    /// Diagnostics, with each frame-rate line: the placeholder space's
+    /// chunks and tile updates, the views no tile follows, what the GPU's
+    /// tiles held against the title's bytes, and what shaders missed.
+    pub(crate) fn log_view_space() {
+        if !tiles_on() {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let (unshared, unqueued, shown) = spaces().as_ref().map_or((0, 0, 0), |s| {
+            let shown: u32 = s
+                .chunks
+                .values()
+                .map(|c| c.shown.iter().map(|w| w.count_ones()).sum::<u32>())
+                .sum();
+            (s.unshared.len(), s.unqueued.len(), shown)
+        });
+        let missed = std::mem::take(&mut *MISSED.lock().unwrap_or_else(|e| e.into_inner()));
+        let missed: Vec<String> = missed.iter().map(|(class, n)| format!("{n} {class}")).collect();
+        tracing::info!(
+            "placeholder space: {} chunks, {shown} tiles shown, {} tile updates; views no tile follows now: \
+             {unshared} of sections with no shared heap ({} ever), {unqueued} mapped with no chunk ({} ever); \
+             {}; missed since the last line: {}",
+            MADE.load(Relaxed),
+            UPDATES.load(Relaxed),
+            UNSHARED.load(Relaxed),
+            UNQUEUED.load(Relaxed),
+            check::summary(),
+            if missed.is_empty() { "nothing".to_owned() } else { missed.join(", ") }
+        );
+    }
+
+    /// Diagnostics: whether the GPU reads through a shown tile what the
+    /// title has at its address. Every [`check::EVERY`]th submission a few
+    /// shown tiles are copied out of their chunk on the host queue and
+    /// compared with the title's bytes, read before and after the copy: a
+    /// tile whose title bytes did not change meanwhile and differ from the
+    /// GPU's is a mapping that does not show the title's memory.
+    mod check {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+        /// Submissions between checks, and tiles a check compares.
+        const EVERY: u64 = 4;
+        const TILES: usize = 4;
+
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        /// Tiles compared; whose title bytes changed meanwhile or could
+        /// not be read; that read all zeros on the GPU while the title's
+        /// were not; that differed otherwise; checks the GPU did not
+        /// finish in time.
+        static COMPARED: AtomicU64 = AtomicU64::new(0);
+        static UNSTABLE: AtomicU64 = AtomicU64::new(0);
+        static ZEROS: AtomicU64 = AtomicU64::new(0);
+        static DIFFERED: AtomicU64 = AtomicU64::new(0);
+        static TIMED_OUT: AtomicU64 = AtomicU64::new(0);
+
+        struct Tools {
+            allocator: ID3D12CommandAllocator,
+            list: ID3D12GraphicsCommandList,
+            fence: ID3D12Fence,
+            back: ID3D12Resource,
+            data: usize,
+            value: u64,
+        }
+        // SAFETY: D3D12 objects are free-threaded; used under the mutex.
+        unsafe impl Send for Tools {}
+        static TOOLS: Mutex<Option<Tools>> = Mutex::new(None);
+
+        pub(super) fn due() -> bool {
+            tiles_on() && CALLS.fetch_add(1, Relaxed) % EVERY == 0
+        }
+
+        pub(super) fn summary() -> String {
+            format!(
+                "tiles checked against title memory: {} equal or changing ({} changing or unreadable), \
+                 {} zeros on the GPU, {} different, {} checks timed out",
+                COMPARED.load(Relaxed),
+                UNSTABLE.load(Relaxed),
+                ZEROS.load(Relaxed),
+                DIFFERED.load(Relaxed),
+                TIMED_OUT.load(Relaxed)
+            )
+        }
+
+        /// Up to [`TILES`] shown tiles: the chunk's buffer, its first
+        /// title address and the tile.
+        pub(super) fn pick(spaces: &Spaces) -> Vec<(ID3D12Resource, usize, usize)> {
+            static SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+            let mut next = || {
+                let mut x = SEED.load(Relaxed);
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                SEED.store(x, Relaxed);
+                x as usize
+            };
+            let chunks: Vec<(&usize, &Chunk)> = spaces.chunks.iter().collect();
+            let mut picked = Vec::new();
+            if chunks.is_empty() {
+                return picked;
+            }
+            for _ in 0..TILES * 4 {
+                if picked.len() == TILES {
+                    break;
+                }
+                let (&first, chunk) = chunks[next() % chunks.len()];
+                let words = chunk.shown.len();
+                let from = next() % words;
+                let Some(word) = (0..words).map(|k| (from + k) % words).find(|&w| chunk.shown[w] != 0)
+                else {
+                    continue;
+                };
+                // A set bit of the word, not always its lowest.
+                let from = next() % 64;
+                let Some(bit) =
+                    (0..64).map(|k| (from + k) % 64).find(|&b| chunk.shown[word] >> b & 1 != 0)
+                else {
+                    continue;
+                };
+                let tile = word * 64 + bit;
+                if !picked.iter().any(|&(_, f, t)| f == first && t == tile) {
+                    picked.push((chunk.reserved.clone(), first, tile));
+                }
+            }
+            picked
+        }
+
+        fn tools(tools: &mut Option<Tools>) -> Option<&mut Tools> {
+            if tools.is_none() {
+                let h = host()?;
+                // SAFETY: plain object creation and a mapping of our buffer.
+                unsafe {
+                    let allocator: ID3D12CommandAllocator =
+                        h.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+                    let list: ID3D12GraphicsCommandList = h
+                        .device
+                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                        .ok()?;
+                    list.Close().ok()?;
+                    let fence: ID3D12Fence = h.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                    let back = h.read_back_buffer((TILES * PAGE) as u64)?;
+                    let mut data = std::ptr::null_mut();
+                    back.Map(0, None, Some(&mut data)).ok()?;
+                    *tools = Some(Tools {
+                        allocator,
+                        list,
+                        fence,
+                        back,
+                        data: data as usize,
+                        value: 0,
+                    });
+                }
+            }
+            tools.as_mut()
+        }
+
+        pub(super) fn run(queue: &ID3D12CommandQueue, tiles: &[(ID3D12Resource, usize, usize)]) {
+            let mut guard = TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(t) = tools(&mut guard) else {
+                return;
+            };
+            let mut before = vec![0u8; tiles.len() * PAGE];
+            let readable: Vec<bool> = tiles
+                .iter()
+                .zip(before.chunks_mut(PAGE))
+                .map(|(&(_, first, tile), bytes)| {
+                    crate::host::read_into((first + tile * PAGE) as *const u8, bytes)
+                })
+                .collect();
+            // SAFETY: our list and readback buffer; the chunks' buffers are
+            // alive (cloned); the queue is the host's.
+            let done = unsafe {
+                if t.allocator.Reset().is_err() || t.list.Reset(&t.allocator, None).is_err() {
+                    return;
+                }
+                for (k, (reserved, _, tile)) in tiles.iter().enumerate() {
+                    t.list.CopyBufferRegion(
+                        &t.back,
+                        (k * PAGE) as u64,
+                        reserved,
+                        (tile * PAGE) as u64,
+                        PAGE as u64,
+                    );
+                }
+                if t.list.Close().is_err() {
+                    return;
+                }
+                let Ok(list) = t.list.cast::<ID3D12CommandList>() else {
+                    return;
+                };
+                queue.ExecuteCommandLists(&[Some(list)]);
+                t.value += 1;
+                if queue.Signal(&t.fence, t.value).is_err() {
+                    return;
+                }
+                let started = std::time::Instant::now();
+                loop {
+                    if t.fence.GetCompletedValue() >= t.value {
+                        break true;
+                    }
+                    if started.elapsed() > std::time::Duration::from_secs(5) {
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            };
+            if !done {
+                TIMED_OUT.fetch_add(1, Relaxed);
+                return;
+            }
+            // SAFETY: the readback buffer's mapping, `TILES` tiles long.
+            let gpu = unsafe { std::slice::from_raw_parts(t.data as *const u8, tiles.len() * PAGE) };
+            let mut after = vec![0u8; PAGE];
+            for (k, &(_, first, tile)) in tiles.iter().enumerate() {
+                let at = first + tile * PAGE;
+                let was = &before[k * PAGE..(k + 1) * PAGE];
+                let got = &gpu[k * PAGE..(k + 1) * PAGE];
+                COMPARED.fetch_add(1, Relaxed);
+                if !readable[k]
+                    || !crate::host::read_into(at as *const u8, &mut after)
+                    || after != was
+                {
+                    UNSTABLE.fetch_add(1, Relaxed);
+                    continue;
+                }
+                if got == was {
+                    continue;
+                }
+                let differing = got.iter().zip(was).filter(|(a, b)| a != b).count();
+                let first_at = got.iter().zip(was).position(|(a, b)| a != b).unwrap_or(0);
+                let zeros = got.iter().all(|&b| b == 0);
+                let counter = if zeros { &ZEROS } else { &DIFFERED };
+                if counter.fetch_add(1, Relaxed) < 24 {
+                    tracing::warn!(
+                        at = format_args!("{at:#x}"),
+                        differing,
+                        first_at,
+                        gpu_all_zero = zeros,
+                        title_all_zero = was.iter().all(|&b| b == 0),
+                        "a shown tile does not hold the title's bytes on the GPU"
+                    );
+                }
+            }
+        }
     }
 
     /// Chunks made and tile updates applied so far (diagnostics).
@@ -757,8 +1161,13 @@ mod view_space {
 }
 #[cfg(any(test, feature = "diagnostics"))]
 pub(crate) use view_space::apply_view_space;
+#[cfg(feature = "diagnostics")]
+pub(crate) use view_space::{log_view_space, note_missed};
 #[cfg(any(test, feature = "diagnostics"))]
-pub use view_space::{view_space_counts, view_space_map, view_space_reserve, view_space_unmap};
+pub use view_space::{
+    view_space_counts, view_space_map, view_space_reserve, view_space_unmap, view_space_unshared,
+    view_space_unshared_gone,
+};
 
 #[cfg(any(test, feature = "diagnostics"))]
 impl Drop for PhysicalHeap {

@@ -2219,9 +2219,24 @@ pub(crate) fn log_held() {
             .map(size)
             .collect(),
     );
+    // Copies over memory an aliased region holds too (a range that crosses
+    // a region's edge): what shaders write through the region does not
+    // reach them, as no watch sees a GPU write.
+    let over = |s: &Arc<Shadow>| has_aliased_overlap(s.start, s.start + s.len);
+    let crossing: Vec<(u64, u64)> = buffers_read()
+        .values()
+        .filter_map(|e| e.shadow.clone())
+        .chain(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned())
+        .filter(over)
+        .map(|s| (s.start, s.len))
+        .collect();
+    let crossing_bytes: u64 = crossing.iter().map(|c| c.1).sum();
+    let first: Vec<String> =
+        crossing.iter().take(4).map(|(a, n)| format!("{a:#x}+{n:#x}")).collect();
     tracing::info!(
         "host buffer copies held: {:.0} MB in all: title buffers {} ({:.0} MB), loose windows {} ({:.0} MB); \
-         aliased regions {} ({:.0} MB, the title's own memory, not extra)",
+         aliased regions {} ({:.0} MB, the title's own memory, not extra); copies over aliased memory {} \
+         ({:.1} MB; first: {})",
         buffers.1 + loose.1,
         buffers.0,
         buffers.1,
@@ -2229,6 +2244,9 @@ pub(crate) fn log_held() {
         loose.1,
         aliased.0,
         aliased.1,
+        crossing.len(),
+        crossing_bytes as f64 / 1e6,
+        first.join(" "),
     );
 }
 

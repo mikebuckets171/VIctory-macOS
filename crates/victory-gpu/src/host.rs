@@ -5927,6 +5927,7 @@ impl Meter {
                 crate::bindless::log(report_frames);
                 crate::heap_worker::log(report_frames);
                 crate::shadow::log_views(report_frames);
+                crate::alias::log_view_space();
                 crate::shadow::log_lookups(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
