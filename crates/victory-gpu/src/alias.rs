@@ -995,7 +995,7 @@ mod view_space {
         /// title address and the tile.
         pub(super) fn pick(spaces: &Spaces) -> Vec<(ID3D12Resource, usize, usize)> {
             static SEED: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
-            let mut next = || {
+            let next = || {
                 let mut x = SEED.load(Relaxed);
                 x ^= x << 13;
                 x ^= x >> 7;
