@@ -460,6 +460,9 @@ impl PhysicalHeap {
 /// pages read zeros. Ranges across two chunks keep host copies.
 #[cfg(any(test, feature = "diagnostics"))]
 mod view_space {
+    // Its diagnostics are called from the HLE side, in diagnostics builds;
+    // the tests build the module without them.
+    #![cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     use super::*;
     use std::collections::BTreeMap;
     use windows::core::Interface;
@@ -722,7 +725,11 @@ mod view_space {
             };
             // Chosen under the lock that takes the pending updates: these
             // tiles are shown once the updates below are made.
-            let to_check = check::due().then(|| check::pick(spaces)).unwrap_or_default();
+            let to_check = if check::due() {
+                check::pick(spaces)
+            } else {
+                Vec::new()
+            };
             if spaces.pending.is_empty() && to_check.is_empty() {
                 return;
             }
@@ -733,83 +740,198 @@ mod view_space {
                 .collect::<Vec<_>>();
             (pending, to_check)
         };
-        for (reserved, p) in &pending {
-            let start = D3D12_TILED_RESOURCE_COORDINATE {
-                X: p.first,
-                ..Default::default()
-            };
-            let size = D3D12_TILE_REGION_SIZE {
-                NumTiles: p.count,
-                ..Default::default()
-            };
-            // SAFETY: the region lies in the chunk's buffer (cut to it when
-            // queued) and the heap range in the heap (the view's bytes);
-            // both stay alive (the chunk keeps its heaps).
+        // One call per run of updates of one chunk to one heap (or to
+        // nothing), in order, runs of consecutive tiles merged (`plan`):
+        // the title maps single 64 KiB pages, and one call each was 109,456
+        // calls before the first submission (run zc3).
+        let keys: Vec<Update> = pending
+            .iter()
+            .map(|(_, p)| {
+                (
+                    p.chunk,
+                    p.first,
+                    p.count,
+                    p.heap
+                        .as_ref()
+                        .map(|(h, tile)| (h.as_raw() as usize, *tile)),
+                )
+            })
+            .collect();
+        let calls = plan(&keys);
+        let mut regions = 0;
+        for call in &calls {
+            let (reserved, first) = &pending[call.first_update];
+            let n = call.regions.len() as u32;
+            regions += call.regions.len();
+            let starts: Vec<D3D12_TILED_RESOURCE_COORDINATE> = call
+                .regions
+                .iter()
+                .map(|r| D3D12_TILED_RESOURCE_COORDINATE {
+                    X: r.0,
+                    ..Default::default()
+                })
+                .collect();
+            let sizes: Vec<D3D12_TILE_REGION_SIZE> = call
+                .regions
+                .iter()
+                .map(|r| D3D12_TILE_REGION_SIZE {
+                    NumTiles: r.1,
+                    ..Default::default()
+                })
+                .collect();
+            let counts: Vec<u32> = call.regions.iter().map(|r| r.1).collect();
+            // SAFETY: every region lies in the chunk's buffer (cut to it when
+            // queued) and every heap range in the heap (the views' bytes);
+            // the arrays hold `n` entries each and outlive the call; the
+            // buffer and the heap stay alive (the chunk keeps its heaps).
             unsafe {
-                match &p.heap {
-                    Some((heap, heap_tile)) => queue.UpdateTileMappings(
-                        reserved,
-                        1,
-                        Some(&start),
-                        Some(&size),
-                        heap,
-                        1,
-                        Some(&D3D12_TILE_RANGE_FLAG_NONE),
-                        Some(heap_tile),
-                        Some(&p.count),
-                        D3D12_TILE_MAPPING_FLAG_NONE,
-                    ),
-                    None => queue.UpdateTileMappings(
-                        reserved,
-                        1,
-                        Some(&start),
-                        Some(&size),
-                        None::<&ID3D12Heap>,
-                        1,
-                        Some(&D3D12_TILE_RANGE_FLAG_NULL),
-                        None,
-                        Some(&p.count),
-                        D3D12_TILE_MAPPING_FLAG_NONE,
-                    ),
+                match &first.heap {
+                    Some((heap, _)) => {
+                        let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; call.regions.len()];
+                        let offsets: Vec<u32> =
+                            call.regions.iter().map(|r| r.2.unwrap_or(0)).collect();
+                        queue.UpdateTileMappings(
+                            reserved,
+                            n,
+                            Some(starts.as_ptr()),
+                            Some(sizes.as_ptr()),
+                            heap,
+                            n,
+                            Some(flags.as_ptr()),
+                            Some(offsets.as_ptr()),
+                            Some(counts.as_ptr()),
+                            D3D12_TILE_MAPPING_FLAG_NONE,
+                        )
+                    }
+                    None => {
+                        let flags = vec![D3D12_TILE_RANGE_FLAG_NULL; call.regions.len()];
+                        queue.UpdateTileMappings(
+                            reserved,
+                            n,
+                            Some(starts.as_ptr()),
+                            Some(sizes.as_ptr()),
+                            None::<&ID3D12Heap>,
+                            n,
+                            Some(flags.as_ptr()),
+                            None,
+                            Some(counts.as_ptr()),
+                            D3D12_TILE_MAPPING_FLAG_NONE,
+                        )
+                    }
                 }
             }
         }
         UPDATES.fetch_add(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        probe_updates(queue, &pending);
+        CALLS_MADE.fetch_add(calls.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        settle(queue, pending.len(), calls.len(), regions);
         if !to_check.is_empty() {
             check::run(queue, &to_check);
         }
     }
 
-    /// Diagnostics (`VICTORY_TILE_PROBE=1`): after a batch of tile updates,
-    /// waits for the queue to pass them (a fence of our own) and logs the
-    /// batch and how long that took, for the first batches and any slow
-    /// one: whether the updates themselves stall the queue (run zc2: the
-    /// first submission after them never finished).
-    fn probe_updates(queue: &ID3D12CommandQueue, pending: &[(ID3D12Resource, Pending)]) {
-        static ON: OnceLock<bool> = OnceLock::new();
-        if !*ON.get_or_init(|| crate::switch::on("VICTORY_TILE_PROBE")) || pending.is_empty() {
+    /// `UpdateTileMappings` calls made, for the logs.
+    pub(crate) static CALLS_MADE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// Regions one call takes at most.
+    const MAX_REGIONS: usize = 4096;
+
+    /// A tile update as [`plan`] sees it: the chunk (its first title
+    /// address), the first tile, the tiles, and the heap (as a key) with
+    /// its first tile, or none for an unmap.
+    pub(crate) type Update = (usize, u32, u32, Option<(usize, u32)>);
+
+    /// One `UpdateTileMappings` call of [`plan`].
+    #[derive(Debug, PartialEq)]
+    pub(crate) struct Planned {
+        /// The update whose chunk and heap the call takes.
+        pub(crate) first_update: usize,
+        /// Each region: its first tile, its tiles, and the heap tile it
+        /// starts at (none: mapped to nothing).
+        pub(crate) regions: Vec<(u32, u32, Option<u32>)>,
+    }
+
+    /// The calls that make `updates` (chunk, first tile, tiles, heap and
+    /// its first tile, or none for an unmap), in order: one call per run of
+    /// consecutive updates of one chunk to one heap (or to nothing) in
+    /// which no tile comes twice (an update of a tile made earlier in the
+    /// batch starts a new call, so the later one wins as before), at most
+    /// [`MAX_REGIONS`] regions each; within a call, consecutive tiles that
+    /// go to consecutive heap tiles (or both to nothing) are one region.
+    pub(crate) fn plan(updates: &[Update]) -> Vec<Planned> {
+        let mut calls: Vec<Planned> = Vec::new();
+        let mut key: Option<(usize, Option<usize>)> = None;
+        let mut seen = std::collections::HashSet::new();
+        for (i, &(chunk, first, count, heap)) in updates.iter().enumerate() {
+            let this = (chunk, heap.map(|h| h.0));
+            let fresh = (first..first + count).all(|tile| !seen.contains(&tile));
+            let room = calls.last().is_some_and(|c| c.regions.len() < MAX_REGIONS);
+            if key != Some(this) || !fresh || !room {
+                calls.push(Planned {
+                    first_update: i,
+                    regions: Vec::new(),
+                });
+                seen.clear();
+                key = Some(this);
+            }
+            seen.extend(first..first + count);
+            let call = calls.last_mut().expect("a call was just made");
+            let tile = heap.map(|h| h.1);
+            match call.regions.last_mut() {
+                Some(last)
+                    if last.0 + last.1 == first
+                        && match (last.2, tile) {
+                            (Some(a), Some(b)) => a + last.1 == b,
+                            (None, None) => true,
+                            _ => false,
+                        } =>
+                {
+                    last.1 += count;
+                }
+                _ => call.regions.push((first, count, tile)),
+            }
+        }
+        calls
+    }
+
+    /// The host queue's own fence for [`settle`], and its last value.
+    struct Settle(ID3D12Fence, u64);
+    // SAFETY: D3D12 fences are free-threaded; used under the mutex.
+    unsafe impl Send for Settle {}
+    static SETTLE: Mutex<Option<Settle>> = Mutex::new(None);
+
+    /// Waits until the host queue has passed the tile updates just made,
+    /// before the submission they precede is launched. On D3DMetal (M5 Pro)
+    /// a submission launched right behind 109,456 single-tile updates never
+    /// finished, twice (runs zc1, zc2); with this wait the queue passed them
+    /// in 615 ms and nothing hung (run zc3). `VICTORY_TILE_NO_WAIT=1` skips
+    /// it, to try without. Logged: with `VICTORY_TILE_PROBE=1` the first 40
+    /// batches, and any batch that took over 100 ms (the first 64).
+    fn settle(queue: &ID3D12CommandQueue, updates: usize, calls: usize, regions: usize) {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static NO_WAIT: OnceLock<bool> = OnceLock::new();
+        static PROBE: OnceLock<bool> = OnceLock::new();
+        static BATCH: AtomicU64 = AtomicU64::new(0);
+        static SLOW: AtomicU64 = AtomicU64::new(0);
+        if *NO_WAIT.get_or_init(|| crate::switch::on("VICTORY_TILE_NO_WAIT")) || updates == 0 {
             return;
         }
-        static BATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        static FENCE: Mutex<Option<(usize, u64)>> = Mutex::new(None);
-        let batch = BATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tiles: u64 = pending.iter().map(|(_, p)| u64::from(p.count)).sum();
-        let unmaps = pending.iter().filter(|(_, p)| p.heap.is_none()).count();
-        let largest = pending.iter().map(|(_, p)| p.count).max().unwrap_or(0);
+        let batch = BATCH.fetch_add(1, Relaxed);
         let Some(h) = host() else { return };
-        let mut guard = FENCE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = SETTLE.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
-            // SAFETY: plain creation; the fence is kept for the process.
-            let Ok(fence) = (unsafe { h.device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) })
-            else {
+            // SAFETY: plain creation.
+            let Ok(fence) = (unsafe {
+                h.device
+                    .CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE)
+            }) else {
                 return;
             };
-            *guard = Some((fence.into_raw() as usize, 0));
+            *guard = Some(Settle(fence, 0));
         }
-        let Some((raw, value)) = guard.as_mut() else { return };
-        // SAFETY: the fence made above, never released.
-        let fence = unsafe { std::mem::ManuallyDrop::new(ID3D12Fence::from_raw(*raw as *mut _)) };
+        let Some(Settle(fence, value)) = guard.as_mut() else {
+            return;
+        };
         *value += 1;
         let started = std::time::Instant::now();
         // SAFETY: a plain signal on the host queue.
@@ -824,16 +946,16 @@ mod view_space {
             if started.elapsed() > std::time::Duration::from_secs(20) {
                 break false;
             }
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            std::thread::sleep(std::time::Duration::from_micros(100));
         };
         let ms = started.elapsed().as_secs_f64() * 1e3;
-        if batch < 40 || !passed || ms > 50.0 {
+        let probe = *PROBE.get_or_init(|| crate::switch::on("VICTORY_TILE_PROBE"));
+        if (probe && batch < 40) || !passed || (ms > 100.0 && SLOW.fetch_add(1, Relaxed) < 64) {
             tracing::info!(
                 batch,
-                updates = pending.len(),
-                tiles,
-                unmaps,
-                largest,
+                updates,
+                calls,
+                regions,
                 passed,
                 ms = format_args!("{ms:.1}"),
                 "tile updates: the queue passed them"
@@ -897,7 +1019,10 @@ mod view_space {
             return "outside placeholder space";
         };
         let holds = |views: &BTreeMap<usize, usize>| {
-            views.range(..=at).next_back().is_some_and(|(&a, &l)| at < a + l)
+            views
+                .range(..=at)
+                .next_back()
+                .is_some_and(|(&a, &l)| at < a + l)
         };
         if holds(&spaces.unshared) {
             return "placeholder space: a view of a section with no shared heap";
@@ -985,17 +1110,25 @@ mod view_space {
             (s.unshared.len(), s.unqueued.len(), shown)
         });
         let missed = std::mem::take(&mut *MISSED.lock().unwrap_or_else(|e| e.into_inner()));
-        let missed: Vec<String> = missed.iter().map(|(class, n)| format!("{n} {class}")).collect();
+        let missed: Vec<String> = missed
+            .iter()
+            .map(|(class, n)| format!("{n} {class}"))
+            .collect();
         tracing::info!(
-            "placeholder space: {} chunks, {shown} tiles shown, {} tile updates; views no tile follows now: \
+            "placeholder space: {} chunks, {shown} tiles shown, {} tile updates in {} calls; views no tile follows now: \
              {unshared} of sections with no shared heap ({} ever), {unqueued} mapped with no chunk ({} ever); \
              {}; missed since the last line: {}",
             MADE.load(Relaxed),
             UPDATES.load(Relaxed),
+            CALLS_MADE.load(Relaxed),
             UNSHARED.load(Relaxed),
             UNQUEUED.load(Relaxed),
             check::summary(),
-            if missed.is_empty() { "nothing".to_owned() } else { missed.join(", ") }
+            if missed.is_empty() {
+                "nothing".to_owned()
+            } else {
+                missed.join(", ")
+            }
         );
     }
 
@@ -1043,7 +1176,7 @@ mod view_space {
             static ON: OnceLock<bool> = OnceLock::new();
             *ON.get_or_init(|| crate::switch::on("VICTORY_TILE_CHECK"))
                 && tiles_on()
-                && CALLS.fetch_add(1, Relaxed) % EVERY == 0
+                && CALLS.fetch_add(1, Relaxed).is_multiple_of(EVERY)
         }
 
         pub(super) fn summary() -> String {
@@ -1082,14 +1215,17 @@ mod view_space {
                 let (&first, chunk) = chunks[next() % chunks.len()];
                 let words = chunk.shown.len();
                 let from = next() % words;
-                let Some(word) = (0..words).map(|k| (from + k) % words).find(|&w| chunk.shown[w] != 0)
+                let Some(word) = (0..words)
+                    .map(|k| (from + k) % words)
+                    .find(|&w| chunk.shown[w] != 0)
                 else {
                     continue;
                 };
                 // A set bit of the word, not always its lowest.
                 let from = next() % 64;
-                let Some(bit) =
-                    (0..64).map(|k| (from + k) % 64).find(|&b| chunk.shown[word] >> b & 1 != 0)
+                let Some(bit) = (0..64)
+                    .map(|k| (from + k) % 64)
+                    .find(|&b| chunk.shown[word] >> b & 1 != 0)
                 else {
                     continue;
                 };
@@ -1106,8 +1242,10 @@ mod view_space {
                 let h = host()?;
                 // SAFETY: plain object creation and a mapping of our buffer.
                 unsafe {
-                    let allocator: ID3D12CommandAllocator =
-                        h.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+                    let allocator: ID3D12CommandAllocator = h
+                        .device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                        .ok()?;
                     let list: ID3D12GraphicsCommandList = h
                         .device
                         .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
@@ -1185,7 +1323,8 @@ mod view_space {
                 return;
             }
             // SAFETY: the readback buffer's mapping, `TILES` tiles long.
-            let gpu = unsafe { std::slice::from_raw_parts(t.data as *const u8, tiles.len() * PAGE) };
+            let gpu =
+                unsafe { std::slice::from_raw_parts(t.data as *const u8, tiles.len() * PAGE) };
             let mut after = vec![0u8; PAGE];
             for (k, &(_, first, tile)) in tiles.iter().enumerate() {
                 let at = first + tile * PAGE;
@@ -1231,6 +1370,7 @@ pub(crate) use view_space::apply_view_space;
 #[cfg(feature = "diagnostics")]
 pub(crate) use view_space::{log_view_space, note_missed};
 #[cfg(any(test, feature = "diagnostics"))]
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_imports))]
 pub use view_space::{
     view_space_counts, view_space_map, view_space_reserve, view_space_unmap, view_space_unshared,
     view_space_unshared_gone,
@@ -1511,6 +1651,97 @@ mod tests {
         run_copy(device, |l| unsafe {
             l.CopyBufferRegion(dst, offset, &up, 0, bytes.len() as u64)
         });
+    }
+
+    /// Tile updates become one call per run of one chunk and one heap,
+    /// consecutive tiles to consecutive heap tiles merged, in order; a tile
+    /// updated twice in a batch starts a new call so the later update wins.
+    #[test]
+    fn tile_updates_are_planned_into_few_calls_in_order() {
+        use super::view_space::{Planned, plan};
+        let (a, b) = (0x1000_0000usize, 0x2000_0000usize);
+        let (h1, h2) = (0x11usize, 0x22usize);
+        // Consecutive tiles to consecutive heap tiles: one region.
+        assert_eq!(
+            plan(&[
+                (a, 0, 1, Some((h1, 10))),
+                (a, 1, 1, Some((h1, 11))),
+                (a, 2, 2, Some((h1, 12)))
+            ]),
+            [Planned {
+                first_update: 0,
+                regions: vec![(0, 4, Some(10))]
+            }]
+        );
+        // Consecutive tiles to scattered heap tiles: one call, a region each.
+        assert_eq!(
+            plan(&[
+                (a, 0, 1, Some((h1, 7))),
+                (a, 1, 1, Some((h1, 3))),
+                (a, 5, 1, Some((h1, 4)))
+            ]),
+            [Planned {
+                first_update: 0,
+                regions: vec![(0, 1, Some(7)), (1, 1, Some(3)), (5, 1, Some(4))]
+            }]
+        );
+        // Another heap, another chunk, unmaps: new calls, in order.
+        let calls = plan(&[
+            (a, 0, 1, Some((h1, 0))),
+            (a, 1, 1, Some((h2, 0))),
+            (a, 2, 1, Some((h1, 1))),
+            (b, 0, 1, Some((h1, 2))),
+            (b, 4, 2, None),
+            (b, 6, 1, None),
+        ]);
+        assert_eq!(
+            calls,
+            [
+                Planned {
+                    first_update: 0,
+                    regions: vec![(0, 1, Some(0))]
+                },
+                Planned {
+                    first_update: 1,
+                    regions: vec![(1, 1, Some(0))]
+                },
+                Planned {
+                    first_update: 2,
+                    regions: vec![(2, 1, Some(1))]
+                },
+                Planned {
+                    first_update: 3,
+                    regions: vec![(0, 1, Some(2))]
+                },
+                Planned {
+                    first_update: 4,
+                    regions: vec![(4, 3, None)]
+                },
+            ]
+        );
+        // Mapped, unmapped, mapped again in one batch: three calls, in order.
+        let calls = plan(&[
+            (a, 3, 1, Some((h1, 9))),
+            (a, 3, 1, None),
+            (a, 3, 1, Some((h1, 5))),
+        ]);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].regions, [(3, 1, Some(5))]);
+        // The same heap again after the tile came up: a fresh call.
+        let calls = plan(&[
+            (a, 3, 1, Some((h1, 9))),
+            (a, 4, 1, Some((h1, 1))),
+            (a, 3, 1, Some((h1, 2))),
+        ]);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].regions, [(3, 1, Some(9)), (4, 1, Some(1))]);
+        // A long run of single pages to scattered heap tiles is capped per call.
+        let many: Vec<_> = (0..10_000u32)
+            .map(|t| (a, t, 1, Some((h1, (t * 7919) % 20_000))))
+            .collect();
+        let calls = plan(&many);
+        assert!(calls.iter().all(|c| c.regions.len() <= 4096));
+        assert_eq!(calls.iter().map(|c| c.regions.len()).sum::<usize>(), 10_000);
     }
 
     #[test]
